@@ -128,16 +128,25 @@ def read_creds_arg(value):
 # ============================================================================
 
 def confirm(prompt):
-    """Ask the user to confirm on the CLI. Returns True on yes.
+    """Ask the user to confirm on the CLI.
 
-    A non-interactive stdin (EOF) is treated as "no" so unattended runs
-    without ``-y`` never silently attempt a login.
+    Returns one of:
+      "yes"   -- proceed with this attempt
+      "skip"  -- skip this attempt, continue the loop
+      "abort" -- abort the whole loop and quit
+
+    A non-interactive stdin (EOF) is treated as "abort" so unattended
+    runs without ``-y`` stop cleanly instead of silently skipping forever.
     """
     try:
-        answer = input("%s [y/N] " % prompt).strip().lower()
+        answer = input("%s [y]es / [n]o / [a]bort " % prompt).strip().lower()
     except EOFError:
-        return False
-    return answer in ("y", "yes", "j", "ja")
+        return "abort"
+    if answer in ("y", "yes", "j", "ja"):
+        return "yes"
+    if answer in ("a", "abort", "q", "quit"):
+        return "abort"
+    return "skip"
 
 
 # ============================================================================
@@ -155,14 +164,19 @@ def run(systems, creds, timeout=5, saprouter="", assume_yes=False,
     """
     findings = []
 
+    total = sum(len(clients) for _, _, clients in systems) * len(creds)
+    index = 0
+
     for sid, hostport, clients in systems:
         host, port_str = hostport.rsplit(":", 1)
         port = int(port_str)
 
         for user, password in creds:
             for client in clients:
+                index += 1
                 print()
                 print("-" * 60)
+                print("  [%d/%d]" % (index, total))
                 print("  System : %s (%s)" % (sid or "?", hostport))
                 print("  Client : %s" % client)
                 print("  User   : %s" % user)
@@ -171,9 +185,14 @@ def run(systems, creds, timeout=5, saprouter="", assume_yes=False,
                     print("  Route  : %s" % saprouter)
                 print("-" * 60)
 
-                if not assume_yes and not confirm("  Attempt this login?"):
-                    print("  [-] Skipped.")
-                    continue
+                if not assume_yes:
+                    choice = confirm("  Attempt this login?")
+                    if choice == "abort":
+                        print("  [!] Aborted by user — stopping.")
+                        return findings
+                    if choice == "skip":
+                        print("  [-] Skipped.")
+                        continue
 
                 result, detail = try_login(
                     host, port, client, user, password,
