@@ -474,7 +474,8 @@ def _classify_rfc_logon_exception(exc) -> tuple:
 
 def rfc_check_credentials(host: str, sysnr: str, client: str,
                           user: str, password: str, *,
-                          saprouter: str = "", timeout=None) -> tuple:
+                          saprouter: str = "", snc_partnername: str = ""
+                          , timeout=None) -> tuple:
     """Validate a single credential via an RFC logon and return a
     structured ``(code, detail)`` in the RFC_CHECK_* vocabulary.
 
@@ -525,16 +526,11 @@ def rfc_check_credentials(host: str, sysnr: str, client: str,
     snc_secudir = _snc_config.get("secudir", "")
     snc_sapcryptolib = _snc_config.get("sapcryptolib", "")
     snc_identity = _snc_config.get("identity", "")
-    node_snc_name = (getattr(node, "snc_partnername", "") or "").strip()
-    if snc_secudir and snc_sapcryptolib and snc_identity and node_snc_name:
+    if snc_secudir and snc_sapcryptolib and snc_identity and len(snc_partnername)>0:
         params["snc_sso"] = "0"
         params["snc_myname"] = snc_identity
-        params["snc_partnername"] = node_snc_name
+        params["snc_partnername"] = snc_partnername
         params["snc_lib"] = snc_sapcryptolib
-        print(f"[*] {node.sid}: SNC params added to connection "
-              f"(snc_myname={snc_identity!r}, "
-              f"snc_partnername={node_snc_name!r}, "
-              f"snc_lib={snc_sapcryptolib!r})")
 
     else:
         missing = []
@@ -544,7 +540,7 @@ def rfc_check_credentials(host: str, sysnr: str, client: str,
             missing.append("state.snc_sapcryptolib")
         if not snc_identity:
             missing.append("state.snc_identity")
-        if not node_snc_name:
+        if not snc_partnername:
             missing.append("node.snc_partnername")
         #print(f"[*] {node.sid}: SNC params NOT added to connection "
         #      f"(missing: {', '.join(missing)})")        

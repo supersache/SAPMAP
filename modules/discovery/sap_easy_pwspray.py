@@ -41,12 +41,13 @@ import json
 import time
 import fnmatch
 import argparse
+import modules
 
 try:
     from sap_default_creds import (try_login, FINDING_RESULTS,
                                     RESULT_DESCRIPTIONS)
 except ImportError:
-    from files.sap_default_creds import (try_login, FINDING_RESULTS,
+    from sap_default_creds import (try_login, FINDING_RESULTS,
                                          RESULT_DESCRIPTIONS)
 
 # RFC-specific verdict: gateway/instance unreachable — NOT a credential
@@ -71,7 +72,7 @@ def _sysnr_from_port(port):
 
 
 def attempt_login(method, host, port, client, user, password,
-                  timeout=5, saprouter=""):
+                  timeout=5, saprouter="", snc_partnername=""):
     """Validate one credential via DIAG or RFC, returning (result, detail).
 
     ``method`` is ``"diag"`` (SAPGUI dispatcher login, the default) or
@@ -86,10 +87,11 @@ def attempt_login(method, host, port, client, user, password,
         try:
             from sapmap_rfc import rfc_check_credentials
         except ImportError:
-            from files.sapmap_rfc import rfc_check_credentials
+            from sapmap_rfc import rfc_check_credentials
         sysnr = _sysnr_from_port(port)
         return rfc_check_credentials(host, sysnr, client, user, password,
-                                     saprouter=saprouter, timeout=timeout)
+                                     saprouter=saprouter, snc_partnername=snc_partnername,
+                                     timeout=timeout)
 
     return try_login(host, port, client, user, password,
                      timeout=timeout, saprouter=saprouter)
@@ -128,11 +130,12 @@ def dispatcher_tuples(data):
                     if svc == "dispatcher")
         host = (inst.get("info") or {}).get("host") or inst.get("ip")
         clients = [c["nr"] for c in node.get("clients", []) if c.get("nr")]
+        snc_partnername = node.get ("snc_partnername")
 
         if not host or not clients:
             continue
 
-        yield (node.get("sid"), "%s:%s" % (host, port), clients)
+        yield (node.get("sid"), "%s:%s" % (host, port), clients, snc_partnername)
 
 
 def load_systems(path):
@@ -140,6 +143,39 @@ def load_systems(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return list(dispatcher_tuples(data))
+
+
+def load_snc_config(path):
+    """Mirror the scan file's SNC posture into sapmap_rfc._snc_config.
+
+    The RFC backend reads its SNC parameters (SECUDIR, sapcryptolib,
+    identity) from the module-global ``sapmap_rfc._snc_config``, which the
+    GUI fills via ``set_snc_config()`` (see ``_mirror_snc_config`` in
+    sapmap_gui.py).  The standalone CLI has no live state, so without this
+    the global stays empty and RFC logons never negotiate SNC — even when
+    a node carries an ``snc_partnername``.
+
+    Reads the three top-level ``snc_*`` fields a ``.sapmap`` state file
+    serialises and pushes them through.  Returns the pushed dict (empty
+    values if the keys are absent).  Safe no-op if the RFC module can't
+    be imported.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cfg = {
+        "secudir": str(data.get("snc_secudir", "") or ""),
+        "sapcryptolib": str(data.get("snc_sapcryptolib", "") or ""),
+        "identity": str(data.get("snc_identity", "") or ""),
+    }
+    try:
+        try:
+            from sapmap_rfc import set_snc_config
+        except ImportError:
+            from files.sapmap_rfc import set_snc_config
+        set_snc_config(**cfg)
+    except Exception as e:
+        print("  [!] Could not mirror SNC config: %s" % e, file=sys.stderr)
+    return cfg
 
 
 # ============================================================================
@@ -171,13 +207,31 @@ def read_creds_arg(value):
 
     ``-`` reads from stdin; an existing file path is read; otherwise the
     value itself is treated as inline (possibly multi-line) credential text.
+
+    Safety: a creds FILE must carry a ``.creds`` extension, otherwise it
+    is rejected (``ValueError``).  This guards against accidentally
+    pointing --creds at the wrong file — a huge wordlist, a system file
+    like /etc/passwd, etc. — which would spray unintended credentials and
+    risk mass account lockouts.
     """
     if value == "-":
         return sys.stdin.read()
     import os
     if os.path.isfile(value):
+        if not value.lower().endswith(".creds"):
+            raise ValueError(
+                "Creds file %r rejected — must have a .creds extension. "
+                "Rename it to <name>.creds, or pass credentials inline / "
+                "via '-' (stdin)." % value)
         with open(value, "r", encoding="utf-8") as f:
             return f.read()
+    # Looks like a .creds file path but doesn't exist — almost certainly a
+    # mistyped path rather than inline credentials.  Reject instead of
+    # silently treating it as inline text (which would parse to nothing).
+    if value.lower().endswith(".creds"):
+        raise ValueError(
+            "Creds file %r not found — check the path. (A value ending in "
+            "'.creds' is treated as a file, never inline text.)" % value)
     return value
 
 
@@ -243,10 +297,10 @@ def _scope_match(key, scope):
 def apply_scope(systems, include=None, exclude=None):
     """Filter the systems list by an include and/or exclude scope.
 
-    ``systems`` is a list of ``(sid, "host:port", [clients])``.  Both
-    ``include`` and ``exclude`` may be given (either or both ``None`` =
-    no filtering for that side).  SID patterns may contain wildcards (see
-    :func:`parse_scope`).
+    ``systems`` is a list of ``(sid, "host:port", [clients],
+    snc_partnername)``.  Both ``include`` and ``exclude`` may be given
+    (either or both ``None`` = no filtering for that side).  SID patterns
+    may contain wildcards (see :func:`parse_scope`).
 
     Order of evaluation: ``include`` is applied first to pick the
     candidate set, then ``exclude`` is subtracted from it — ``exclude``
@@ -254,7 +308,7 @@ def apply_scope(systems, include=None, exclude=None):
     client list becomes empty are dropped.
     """
     filtered = []
-    for sid, hostport, clients in systems:
+    for sid, hostport, clients, snc_partnername in systems:
         key = (sid or "").upper()
 
         # 1. include — narrow to the candidate clients (no include = all).
@@ -275,7 +329,7 @@ def apply_scope(systems, include=None, exclude=None):
                 kept = [c for c in kept if c not in drop]
 
         if kept:
-            filtered.append((sid, hostport, kept))
+            filtered.append((sid, hostport, kept, snc_partnername))
     return filtered
 
 
@@ -350,7 +404,7 @@ def record_attempt(proto, sysid, client, user, password, result):
 def plan_attempts(systems, creds):
     """Expand (systems x creds x clients) into a flat list of attempt dicts."""
     plan = []
-    for sid, hostport, clients in systems:
+    for sid, hostport, clients, snc_partnername in systems:
         host, port_str = hostport.rsplit(":", 1)
         for user, password in creds:
             for client in clients:
@@ -358,6 +412,7 @@ def plan_attempts(systems, creds):
                     "sid": sid, "hostport": hostport,
                     "host": host, "port": int(port_str),
                     "client": client, "user": user, "password": password,
+                    "snc_partnername": snc_partnername,
                 })
     return plan
 
@@ -494,6 +549,7 @@ def run(plan, proto, protocol_path, timeout=5, saprouter="",
     for index, p in enumerate(plan, start=1):
         sid, host, port = p["sid"], p["host"], p["port"]
         client, user, password = p["client"], p["user"], p["password"]
+        snc_partnername = p["snc_partnername"] 
         is_collision = ((sid or "").upper(), client,
                         (user or "").upper()) in collision_set
 
@@ -520,7 +576,7 @@ def run(plan, proto, protocol_path, timeout=5, saprouter="",
 
         result, detail = attempt_login(
             method, host, port, client, user, password,
-            timeout=timeout, saprouter=saprouter)
+            timeout=timeout, saprouter=saprouter, snc_partnername=snc_partnername)
 
         # Record every executed attempt immediately (audit + lockout guard).
         # Exception: an RFC CONNECT_FAILED is not a credential verdict (the
@@ -565,10 +621,11 @@ Examples:
     parser.add_argument("-i", "--input",
                         help="SAPMAP scan / .sapmap JSON file")
     parser.add_argument("-c", "--creds",
-                        help="Credentials as 'user:password' per line — a file "
-                             "path, inline text, or '-' for stdin")
-    parser.add_argument("--protocol", default="pwspray_protocol.json",
-                        help="Test-protocol JSON log (default: pwspray_protocol.json)")
+                        help="Credentials as 'user:password' per line — a "
+                             "'.creds' file path, inline text, or '-' for "
+                             "stdin")
+    parser.add_argument("--protocol", required=True,
+                        help="Test-protocol JSON log (required)")
     parser.add_argument("--init-protocol", action="store_true",
                         help="Create a fresh protocol file seeded with the "
                              "in-scope systems/clients, then exit")
@@ -578,6 +635,10 @@ Examples:
                              "(authenticated RFC — validates non-dialog "
                              "SYSTEM/COMMUNICATION/SERVICE users; needs the "
                              "RFC backend)")
+    parser.add_argument("--sdk", default="",
+                        help="Path to the SAP NW RFC SDK library directory "
+                             "(e.g. /opt/nwrfcsdk/lib). Only used with "
+                             "--method rfc")
     parser.add_argument("--saprouter", default="",
                         help="SAProuter route string prefix (e.g. /H/host/S/3299)")
     parser.add_argument("--timeout", type=int, default=5,
@@ -618,11 +679,35 @@ Examples:
         print("Created protocol %s." % (args.protocol))
         return 0
 
-    if not args.input or not args.creds or not args.protocol:
-        parser.error("-i/--input and -c/--creds and --protocol are required")
+    if not args.input or not args.creds:
+        parser.error("-i/--input and -c/--creds are required")
 
     systems = load_systems(args.input)
-    creds = parse_creds(read_creds_arg(args.creds))
+    try:
+        creds = parse_creds(read_creds_arg(args.creds))
+    except ValueError as e:
+        parser.error(str(e))
+
+    # RFC needs the SNC posture mirrored into sapmap_rfc; the CLI has no
+    # live state, so pull it from the scan file (see load_snc_config).
+    if args.method == "rfc":
+        if args.sdk:
+            try:
+                try:
+                    from sapmap_rfc import set_sdk_path
+                except ImportError:
+                    from files.sapmap_rfc import set_sdk_path
+                set_sdk_path(args.sdk)
+                print("SDK         : %s" % args.sdk)
+            except Exception as e:
+                print("  [!] Could not set SDK path: %s" % e, file=sys.stderr)
+        snc = load_snc_config(args.input)
+        if all(snc.values()):
+            print("SNC         : enabled (identity=%s)" % snc["identity"])
+        elif any(snc.values()):
+            missing = [k for k, v in snc.items() if not v]
+            print("SNC         : partial — missing %s (SNC not negotiated)"
+                  % ", ".join(missing))
 
     if not systems:
         print("No ABAP dispatcher systems found in scan file.", file=sys.stderr)
