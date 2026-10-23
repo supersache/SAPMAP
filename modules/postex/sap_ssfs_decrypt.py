@@ -155,6 +155,61 @@ def decrypt_payload(rec, key):
 
 
 # ---------------------------------------------------------------------------
+# Public API (for use by other modules)
+# ---------------------------------------------------------------------------
+
+def get_ssfs_record(dat, name, key=None):
+    """Look up a single SSFS record by IDENT and return it as a dict.
+
+    This is the programmatic entry point for other modules — it prints
+    nothing and reuses the same parsing/decryption as the CLI.
+
+    :param dat:  raw bytes of an ``SSFS_<SID>.DAT`` file
+    :param name: the record IDENT to look up (the *active* record wins when a
+                 deleted record shares the same IDENT)
+    :param key:  optional 24-byte SSFS key; defaults to ``DEFAULT_KEY_HEX``
+
+    :returns: ``None`` if no active record with that IDENT exists, otherwise a
+        dict:
+
+          * plaintext record::
+
+                {"ident": name, "value": <str>, "encrypted": False,
+                 "decrypted": True}
+
+          * encrypted record (``value`` is the decrypted byte-array)::
+
+                {"ident": name, "value": <bytes>, "encrypted": True,
+                 "decrypted": True}
+
+        When an encrypted payload cannot be decrypted (unusable block length or
+        a crypto error) the still-encrypted bytes are returned with
+        ``"decrypted": False`` so the caller can decide what to do.
+    """
+    wanted = name.strip() if isinstance(name, str) else name
+    matches = [r for r in enumerate_records(dat)
+               if r.ident == wanted and not r.is_deleted]
+    if not matches:
+        return None
+    rec = matches[0]
+
+    if rec.is_plaintext:
+        return {"ident": rec.ident, "value": as_string(rec.raw),
+                "encrypted": False, "decrypted": True}
+
+    k = key if key is not None else bytes.fromhex(DEFAULT_KEY_HEX)
+    if len(rec.raw) >= 8 and len(rec.raw) % 8 == 0:
+        try:
+            from sap_rsec_cipher import rsec_decrypt
+            return {"ident": rec.ident, "value": rsec_decrypt(rec.raw, k),
+                    "encrypted": True, "decrypted": True}
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ident": rec.ident, "value": rec.raw,
+            "encrypted": True, "decrypted": False}
+
+
+# ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 
