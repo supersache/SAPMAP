@@ -429,8 +429,23 @@ def _correct_node_from_http(target_node, http_info: dict):
             target_node.instances[0].ports = new_p
             print(f"[*] {target_node.sid}: corrected "
                   f"instance {old_i}→{probed}")
-    if http_info.get("ip") and not target_node.ip:
-        target_node.ip = http_info["ip"]
+    _reach_ip = http_info.get("ip")
+    _rep_ip = http_info.get("reported_ip")
+    if _reach_ip and not target_node.ip:
+        target_node.ip = _reach_ip
+    elif (_reach_ip and _rep_ip and _reach_ip != _rep_ip
+            and target_node.ip == _rep_ip):
+        # A pre-fix run stored the target's self-reported (internal/NAT)
+        # address as the node IP.  We now know the reachable address, so
+        # promote it and demote the internal one to reported_ip — otherwise
+        # reloading that saved state keeps pointing at an unroutable IP.
+        print(f"[*] {target_node.sid}: repaired node IP "
+              f"{target_node.ip}→{_reach_ip} (was self-reported internal)")
+        target_node.ip = _reach_ip
+    # The target's self-reported (often internal/NAT) IP — kept for recon,
+    # shown only when it differs from the reachable node IP.
+    if _rep_ip and _rep_ip != target_node.ip:
+        target_node.reported_ip = _rep_ip
     if http_info.get("hostname") and not target_node.hostname:
         target_node.hostname = http_info["hostname"]
     icm_port = http_info.get("icm_port")
@@ -2700,12 +2715,34 @@ def _build_linuxlpe_shell_dispatch(prog: str, params_str: str) -> str:
 
 def _mirror_snc_config(state):
     """Push the state's SNC posture into sapmap_rfc so authenticated RFC
-    connections can negotiate SNC.  Safe no-op on any error."""
+    connections can negotiate SNC.  Safe no-op on any error.
+
+    Also mirrors the ACTIVE looted-PSE client identity (issue #137) so a
+    reloaded .sapmap that had a looted identity selected keeps using it.
+    ``set_snc_identity(None)`` when nothing is active reverts to the
+    operator posture above.
+    """
     try:
         sapmap_rfc.set_snc_config(
             secudir=getattr(state, "snc_secudir", "") or "",
             sapcryptolib=getattr(state, "snc_sapcryptolib", "") or "",
             identity=getattr(state, "snc_identity", "") or "")
+    except Exception:
+        pass
+    try:
+        active = state.active_snc_credential()
+        # Tag the key type once on activation so the `auto` path chooser
+        # can route RSA PSEs to the native (no-CommonCryptoLib) path and
+        # EC PSEs to CommonCryptoLib.  Probing here (not per-connection)
+        # gives _pse_key_is_rsa a real caller and persists the verdict onto
+        # the stored cred, so it survives the next .sapmap save.
+        if (active is not None and active.key_is_rsa is None
+                and active.pse_path):
+            verdict = sapmap_rfc._pse_key_is_rsa(active.pse_path,
+                                                 active.pin or "")
+            if verdict is not None:
+                active.key_is_rsa = verdict
+        sapmap_rfc.set_snc_identity(active.to_dict() if active else None)
     except Exception:
         pass
 
@@ -3017,6 +3054,21 @@ class SAPMAPApi:
     def get_state_dict(self):
         """Get current state as a dict for the frontend."""
         d = self.state.to_dict()
+        # #137 PR2: the SNC wallet's to_dict() serializes the PSE PIN
+        # (needed for the .sapmap round-trip, which is loot).  Drop it
+        # before shipping to the browser — nothing in the UI needs it,
+        # and keeping it out of the polling payload prevents a stray
+        # browser-side leak (devtools, extension, screenshot).  The
+        # on-disk state file is unchanged; state.to_dict() stays the
+        # single source of truth for save_state().  Same shape as the
+        # /api/snc/wallet route (which also pops "pin") so any future
+        # consumer sees one consistent masking convention.
+        wallet = d.get("snc_credentials") or {}
+        if wallet:
+            d["snc_credentials"] = {
+                cid: {k: v for k, v in cd.items() if k != "pin"}
+                for cid, cd in wallet.items()
+            }
         d["scan_state"] = self.scan_state
         d["scan_error"] = self.scan_error
         d["stats"] = self.state.stats()
@@ -5752,6 +5804,44 @@ def create_app(api: SAPMAPApi) -> Bottle:
                     lib_path = candidate
             except Exception:
                 lib_exists = False
+        # #137 PR2: active looted-PSE client identity (if any) so the
+        # Configure SNC modal can render a status row — tells the
+        # operator which identity SAPMAP actually presents on SNC
+        # logons right now, and which path (native/cryptolib) it uses.
+        active_cred = None
+        active_path = ""
+        active_reach = []
+        try:
+            cred = api.state.active_snc_credential()
+            if cred is not None:
+                active_cred = {
+                    "cred_id":      cred.cred_id,
+                    "source_sid":   cred.source_sid,
+                    "snc_identity": cred.snc_identity,
+                    "key_is_rsa":   cred.key_is_rsa,
+                    "path_pref":    cred.path_pref,
+                    "source_label": cred.source_label,
+                    "looted_at":    cred.looted_at,
+                }
+                # Resolve the effective path: path_pref 'auto' selects
+                # native when the key is affirmatively RSA, else
+                # cryptolib (mirrors the chooser in _snc_params_for).
+                pref = (cred.path_pref or "auto").lower()
+                if pref == "native":
+                    active_path = "native"
+                elif pref == "cryptolib":
+                    active_path = "cryptolib"
+                else:   # auto
+                    if cred.key_is_rsa is True:
+                        active_path = "native"
+                    elif cred.key_is_rsa is False:
+                        active_path = "cryptolib"
+                    else:
+                        active_path = "unprobed"
+                active_reach = api.state.reach_targets_for_snc_identity(
+                    cred.source_sid)
+        except Exception:
+            pass
         return json.dumps({
             "secudir": secudir,
             "sapcryptolib": lib_exists,
@@ -5760,6 +5850,12 @@ def create_app(api: SAPMAPApi) -> Bottle:
             # Previously-saved SNC Identity (if any) so the modal can
             # prefill the read-only field on re-open.
             "snc_identity": getattr(api.state, "snc_identity", "") or "",
+            # #137 PR2: looted-PSE wallet surface
+            "active_snc_cred_id": getattr(api.state, "active_snc_cred_id",
+                                           "") or "",
+            "active_snc_credential": active_cred,
+            "active_snc_path": active_path,
+            "active_snc_reach": active_reach,
         })
 
     @app.route("/api/snc/test", method="POST")
@@ -5828,7 +5924,98 @@ def create_app(api: SAPMAPApi) -> Bottle:
             secudir=api.state.snc_secudir,
             sapcryptolib=api.state.snc_sapcryptolib,
             identity=api.state.snc_identity)
-        return json.dumps({"ok": True})        
+        return json.dumps({"ok": True})
+
+    # #137 PR2 — Looted-PSE SNC client-identity wallet routes.
+    # The wallet is populated by the forge chain when a PSE is looted
+    # (modules/exploitation/sapmap_exploit.py), and persisted on the
+    # SAPMAPState (snc_credentials dict + active_snc_cred_id).  These
+    # routes let the operator LIST it, SELECT one entry as the active
+    # SNC client identity ("Use this PSE as SNC identity"), and CLEAR
+    # the selection to revert to the operator posture.  Changes mirror
+    # into sapmap_rfc via _mirror_snc_config (the same call state-load
+    # and state-upload already make).
+    @app.route("/api/snc/wallet", method="GET")
+    def get_snc_wallet():
+        """List looted-PSE SNC client identities + the active selection.
+
+        PIN is NEVER returned — the wallet is loot the state file carries,
+        and the browser has no legitimate need for the PSE PIN.
+        """
+        response.content_type = "application/json"
+        creds = []
+        try:
+            state_wallet = getattr(api.state, "snc_credentials", {}) or {}
+            for cid, c in state_wallet.items():
+                d = c.to_dict()
+                # strip secret material before the dict leaves the backend
+                d.pop("pin", None)
+                creds.append(d)
+            # Deterministic order for stable GUI rendering
+            creds.sort(key=lambda d: (d.get("source_sid", ""),
+                                       d.get("cred_id", "")))
+        except Exception:
+            creds = []
+        return json.dumps({
+            "credentials": creds,
+            "active_snc_cred_id": getattr(api.state, "active_snc_cred_id",
+                                           "") or "",
+        })
+
+    @app.route("/api/snc/wallet/activate", method="POST")
+    def activate_snc_wallet():
+        """Select a looted PSE as the active SNC client identity.
+
+        Body: ``{"cred_id": "<SID>:<stem>"}`` (canonical selector) OR
+        ``{"source_sid": "<SID>"}`` (convenience — resolves to the unique
+        wallet entry for that source, erroring on ambiguity).  Empty /
+        missing both clears the selection (same as /clear; matches
+        set_active_snc_credential("") semantics on the model).
+        """
+        response.content_type = "application/json"
+        data = request.json or {}
+        cred_id = str(data.get("cred_id", "") or "")
+        source_sid = str(data.get("source_sid", "") or "").strip().upper()
+        # Resolve source_sid → cred_id when cred_id wasn't given.  Convenient
+        # for scripts that just want "the PSE from this SID"; errors cleanly
+        # when the operator looted >1 PSE from one box.
+        if not cred_id and source_sid:
+            matches = [cid for cid, c
+                       in (api.state.snc_credentials or {}).items()
+                       if (c.source_sid or "") == source_sid]
+            if len(matches) == 1:
+                cred_id = matches[0]
+            elif len(matches) == 0:
+                return json.dumps({
+                    "ok": False, "active_snc_cred_id":
+                    api.state.active_snc_cred_id or "",
+                    "error": f"no looted PSE for source_sid {source_sid!r}",
+                })
+            else:
+                return json.dumps({
+                    "ok": False, "active_snc_cred_id":
+                    api.state.active_snc_cred_id or "",
+                    "error": (f"ambiguous: source_sid {source_sid!r} has "
+                              f"{len(matches)} PSEs — pass cred_id explicitly "
+                              f"(one of: {', '.join(matches)})"),
+                })
+        ok = api.state.set_active_snc_credential(cred_id)
+        if ok:
+            _mirror_snc_config(api.state)
+        return json.dumps({
+            "ok": ok,
+            "active_snc_cred_id": getattr(api.state, "active_snc_cred_id",
+                                           "") or "",
+            "error": ("" if ok else f"unknown cred_id {cred_id!r}"),
+        })
+
+    @app.route("/api/snc/wallet/clear", method="POST")
+    def clear_snc_wallet():
+        """Revert to the operator-posture SNC identity (no looted PSE)."""
+        response.content_type = "application/json"
+        api.state.set_active_snc_credential("")
+        _mirror_snc_config(api.state)
+        return json.dumps({"ok": True, "active_snc_cred_id": ""})
 
 
     @app.route("/api/settings/local", method="POST")
@@ -8286,6 +8473,42 @@ def create_app(api: SAPMAPApi) -> Bottle:
                         break
                 if not node.db_type:
                     print(f"[*] No database ports detected on {host}")
+
+            # Issue #167: when this node has working credentials AND an SNC
+            # name is set, additionally read RFC_SYSTEM_INFO over the
+            # AUTHENTICATED SNC path (sapmap_rfc.get_rfc_system_info →
+            # saprfclib → 48XX).  The anonymous enrich above cannot traverse
+            # SNC, so on an SNC-secured system this authenticated read is the
+            # only way the "RFC System Info" refresh yields data.  Its result
+            # is authoritative, so it takes precedence over the anon fields.
+            try:
+                _creds = node.best_credentials()
+            except Exception:
+                _creds = None
+            _snc_name = (getattr(node, "snc_partnername", "") or "").strip()
+            if _creds and _snc_name:
+                print(f"[*] {node.sid}: trying authenticated SNC "
+                      f"RFC_SYSTEM_INFO (48XX)...")
+                si = sapmap_rfc.get_rfc_system_info(node, _creds)
+                if si.get("error"):
+                    print(f"[*] {node.sid}: authenticated SNC system info "
+                          f"unavailable: {si['error']}")
+                else:
+                    if si.get("sid") and node.sid.startswith("UNK"):
+                        node.sid = si["sid"]
+                    node.hostname = si.get("hostname") or node.hostname
+                    node.os_type = si.get("os_type") or node.os_type
+                    node.db_type = si.get("db_type") or node.db_type
+                    node.kernel = si.get("kernel") or node.kernel
+                    node.sap_release = si.get("sap_release") or node.sap_release
+                    if si.get("ip"):
+                        node.ip = si["ip"]
+                    if si.get("source"):
+                        node.sysinfo_source = si["source"]
+                    print(f"[+] {node.sid}: RFC_SYSTEM_INFO over SNC "
+                          f"(authenticated) — SID={node.sid}, "
+                          f"kernel={node.kernel or '?'}, "
+                          f"host={node.hostname or '?'}")
 
         _bg(f"{sid}:rfc_system_info", "RFC System Info", _run)
         return json.dumps({"status": "started"})
@@ -12350,14 +12573,32 @@ def create_app(api: SAPMAPApi) -> Bottle:
                     remote_host = (
                         ping.get("remote_hostname", "").strip()
                         or conn.target_host or host)
-                    # If target_host was a hostname (not IP), use the
-                    # IP returned by RFC_SYSTEM_INFO on the SAP system
+                    # RFC_SYSTEM_INFO reports the target's OWN view of its IP
+                    # (RFCIPADDR).  Only adopt it as the node IP when `host`
+                    # was a HOSTNAME we couldn't otherwise resolve — the
+                    # original intent.  When `host` is already a reachable IP,
+                    # keep it: RFCIPADDR is frequently an internal/NAT address
+                    # (e.g. 172.17.x Docker) that isn't routable from here, so
+                    # replacing the reachable IP with it would break
+                    # reachability.  Record the self-reported one as
+                    # reported_ip instead (surfaced in the UI only when != ip).
+                    import re as _re_rip
+                    _host_is_ip = bool(_re_rip.match(
+                        r'^\d{1,3}(?:\.\d{1,3}){3}$', host)) or (':' in host)
+                    reported_ip = ""
                     if remote_ip and remote_ip != host:
-                        print(f"[*] Resolved {host} → {remote_ip} "
-                              f"(via RFC_SYSTEM_INFO)")
-                        conn.target_ip = remote_ip
-                        host = remote_ip
-                        key = (host.lower(), inst)  # update dedup key
+                        if not _host_is_ip:
+                            print(f"[*] Resolved {host} → {remote_ip} "
+                                  f"(via RFC_SYSTEM_INFO)")
+                            conn.target_ip = remote_ip
+                            host = remote_ip
+                            key = (host.lower(), inst)  # update dedup key
+                        else:
+                            reported_ip = remote_ip
+                            conn.reported_ip = remote_ip
+                            print(f"[*] {conn.destination_name}: system "
+                                  f"self-reports {remote_ip} (internal) — "
+                                  f"keeping reachable {host}")
                     print(f"[+] {conn.destination_name}: alive"
                           f"{f' (SID={dest_sid})' if dest_sid else ''}"
                           f" ({ping['ping_message'][:60]})")
@@ -12377,8 +12618,13 @@ def create_app(api: SAPMAPApi) -> Bottle:
                     _http_info = {}
                     if ping_inst:
                         _http_info["instance_nr"] = ping_inst
-                    if remote_ip:
-                        _http_info["ip"] = remote_ip
+                    # Node IP = the REACHABLE address, not the self-reported
+                    # internal one.  `host` is what we reached (updated above
+                    # only when it was a hostname resolved via RFCIPADDR).
+                    if host and (_host_is_ip or host == remote_ip):
+                        _http_info["ip"] = host
+                    if reported_ip:
+                        _http_info["reported_ip"] = reported_ip
                     if remote_host:
                         _http_info["hostname"] = remote_host
 
@@ -17664,18 +17910,10 @@ def create_app(api: SAPMAPApi) -> Bottle:
                 print(f"[-] No credentials available for {sid}")
                 return
             tgt_host = tgt_node.ip or tgt_node.hostname
-            # Find gateway port on target
-            gw_port = ""
-            for inst in tgt_node.instances:
-                for port, svc in inst.ports.items():
-                    if svc == "gateway" or (3300 <= port <= 3399):
-                        gw_port = str(port)
-                        break
-                if gw_port:
-                    break
-            if not gw_port:
-                nrs = tgt_node.instance_nrs()
-                gw_port = f"33{nrs[0]}" if nrs else "3300"
+            # Pick the target's gateway port SNC-aware (#172): an SNC
+            # system's registered-program gateway is gw/snc_port (4800+NN),
+            # not the plain 33NN which is typically firewalled.
+            gw_port = sapmap_rfc._resolve_gateway_service(tgt_node)
             print(f"[*] Creating TCP/IP dest from {sid} → "
                   f"{target_sid} ({tgt_host}, gw={gw_port})...")
             # Phase 3b: when the SOURCE node's gateway is firewalled,
@@ -17685,6 +17923,13 @@ def create_app(api: SAPMAPApi) -> Bottle:
             # path (SAPMAP_<sid>_<timestamp>).
             _td_sess, _ = resolve_soap_session_for_node(
                 api.state, node)
+            # Part 2 of #172: if the target gateway enforces SNC, the
+            # registered-program connection the destination will make
+            # must itself be SNC-secured — otherwise SDEST E 017 at
+            # use, even when pointed at 4800+NN.  Thread the target's
+            # own partner name; the gate inside each helper decides
+            # whether to actually add SNC_ACTIVE / SNC_PARAMETER.
+            _tgt_snc_name = getattr(tgt_node, "snc_partnername", "") or ""
             if _td_sess is not None:
                 from datetime import datetime as _dt
                 _ts = _dt.now().strftime("%Y%m%d%H%M%S")
@@ -17699,11 +17944,21 @@ def create_app(api: SAPMAPApi) -> Bottle:
                     gateway_host=tgt_host,
                     gateway_service=gw_port,
                     description=(f"TCP/IP CONNECTION TO "
-                                 f"{target_sid or tgt_host}"))
+                                 f"{target_sid or tgt_host}"),
+                    snc_partnername=_tgt_snc_name)
+                # Mirror the pyrfc path's SNC-aware print so the
+                # operator can see from the console whether SNC was
+                # threaded into the SM59 record on this branch too.
+                if result.get("success"):
+                    _snc_tag = " SNC" if _tgt_snc_name else ""
+                    print(f"[+] {sid}: Created TCP/IP dest "
+                          f"{dest_name_guess} → {tgt_host} "
+                          f"(gw={gw_port}{_snc_tag}) via SOAP-RFC")
             else:
                 result = sapmap_rfc.create_tcpip_destination(
                     node, tgt_host, target_sid=target_sid,
-                    target_gw_port=gw_port, creds=creds
+                    target_gw_port=gw_port, creds=creds,
+                    snc_partnername=_tgt_snc_name,
                 )
             if not result["success"]:
                 print(f"[-] Failed: {result['message']}")
@@ -18002,6 +18257,19 @@ def create_app(api: SAPMAPApi) -> Bottle:
                     host, probe_port, timeout=8,
                     saprouter=node.saprouter)
             print(f"[+] {sid}: {format_summary(node.snc_info)}")
+            # Also harvest the SNC partner name from the Message Server
+            # text/logon access-point list (issue #167) so the SNC panel
+            # shows the system's SNC identity, not just posture.  Router
+            # nodes have no Message Server, so skip them.
+            if not is_router:
+                try:
+                    _cands = sapmap_scanner._ms_http_candidates(node)
+                    if _cands:
+                        sapmap_scanner.harvest_ms_snc_name(
+                            node, _cands, timeout=8,
+                            saprouter=(node.saprouter or ""))
+                except Exception as _e:
+                    print(f"[!] {sid}: SNC-name harvest skipped: {_e}")
             # ATT&CK: TA0007 T1082 — passive SNC-capability
             # discovery.  Info-level; carries the summary text so
             # the finding drawer shows the actual posture.
@@ -19306,6 +19574,72 @@ def create_app(api: SAPMAPApi) -> Bottle:
             except Exception as e:
                 logger.debug(f"{sid}: CVE-58240 check failed: {e}")
 
+            # Auto-detect SNC posture so a manually-added system shows its SNC
+            # status in System Details without a separate "Check SNC Posture"
+            # run.  Mirrors the network-scan path (sapmap_scanner) and the
+            # per-node action: DIAG SNC fingerprint on the dispatcher (32NN),
+            # or the SAProuter port for a router node, stored on node.snc_info.
+            print(f"[*] {sid}: Checking SNC posture...")
+            try:
+                from sap_snc import (scan_snc_diag, scan_snc_router,
+                                     format_summary as _snc_summary)
+                _is_router = "SAPROUTER" in (node.system_type or "").upper()
+                _snc_port = 0
+                if _is_router:
+                    for _inst in node.instances:
+                        for _p, _svc in (_inst.ports or {}).items():
+                            if _svc == "saprouter":
+                                _snc_port = _p
+                                break
+                        if _snc_port:
+                            break
+                    if not _snc_port:
+                        _snc_port = 3299
+                else:
+                    for _inst in node.instances:
+                        for _p, _svc in (_inst.ports or {}).items():
+                            if _svc == "dispatcher" or 3200 <= _p <= 3299:
+                                _snc_port = _p
+                                break
+                        if _snc_port:
+                            break
+                if _snc_port:
+                    if _is_router:
+                        node.snc_info = scan_snc_router(
+                            host, _snc_port, timeout=8, saprouter=saprouter)
+                    else:
+                        node.snc_info = scan_snc_diag(
+                            host, _snc_port, timeout=8, saprouter=saprouter)
+                    print(f"[+] {sid}: {_snc_summary(node.snc_info)}")
+                    try:
+                        if (node.snc_info.get("checked")
+                                and node.snc_info.get("enabled")):
+                            emit_finding(
+                                "INFO", sid,
+                                f"SNC posture: {_snc_summary(node.snc_info)}",
+                                ref="snc.posture",
+                                attack_capability="recon.snc_posture")
+                    except Exception:
+                        pass
+                else:
+                    print(f"[*] {sid}: no dispatcher/router port for SNC probe")
+            except Exception as e:
+                logger.debug(f"{sid}: SNC posture check failed: {e}")
+
+            # Harvest the SNC partner name from the MS text/logon access-point
+            # list so a manually-added system shows its SNC identity in the SNC
+            # panel without a separate Re-probe (issue #167).
+            try:
+                if ("SAPROUTER" not in (node.system_type or "").upper()
+                        and sapmap_scanner._has_ms_port(node)):
+                    _cands = sapmap_scanner._ms_http_candidates(node)
+                    if _cands:
+                        sapmap_scanner.harvest_ms_snc_name(
+                            node, _cands, timeout=8,
+                            saprouter=(saprouter or ""))
+            except Exception as _e2:
+                logger.debug(f"{sid}: SNC-name harvest failed: {_e2}")
+
         _bg(f"{sid}:enrich", "Enriching via RFC_SYSTEM_INFO", _enrich)
 
         return json.dumps({"status": "ok"})
@@ -20238,6 +20572,51 @@ def create_app(api: SAPMAPApi) -> Bottle:
         response.content_type = "application/json"
         chains = getattr(api.state, '_trust_chains', [])
         return json.dumps({"chains": chains})
+
+    @app.route("/api/actions/blast_radius", method="POST")
+    def actions_blast_radius():
+        """Flood one node's reachable set (issue #197).
+
+        Pure graph walk over the lateral-movement adjacency — fast enough
+        to answer synchronously (no _bg thread).  ``mode='forward'`` floods
+        what the node can reach; ``mode='inverse'`` floods every system that
+        can reach it (the crown-jewel exposure cone)."""
+        response.content_type = "application/json"
+        data = request.json or {}
+        sid = (data.get("sid") or "").strip()
+        mode = (data.get("mode") or "forward").strip().lower()
+        try:
+            max_depth = int(data.get("max_depth", 6))
+        except (TypeError, ValueError):
+            max_depth = 6
+        max_depth = max(1, min(max_depth, 12))   # clamp to a sane range
+        if not sid:
+            return json.dumps({"status": "error",
+                               "error": "no sid given"})
+        import sapmap_chain
+        if mode == "inverse":
+            result = sapmap_chain.exposure_cone(api.state, sid, max_depth)
+        else:
+            result = sapmap_chain.blast_radius(api.state, sid, max_depth)
+        result["status"] = "ok"
+        return json.dumps(result)
+
+    @app.route("/api/actions/exploit_distances", method="POST")
+    def actions_exploit_distances():
+        """Shortest exploit distance to every system from the nearest entry
+        point (issue #198) — the ring index the defense-in-depth rings
+        layout places nodes by.  Pure graph walk, answered synchronously."""
+        response.content_type = "application/json"
+        data = request.json or {}
+        try:
+            max_depth = int(data.get("max_depth", 6))
+        except (TypeError, ValueError):
+            max_depth = 6
+        max_depth = max(1, min(max_depth, 12))   # clamp to a sane range
+        import sapmap_chain
+        result = sapmap_chain.exploit_distances(api.state, max_depth)
+        result["status"] = "ok"
+        return json.dumps(result)
 
     @app.route("/api/actions/check_all_betrusted", method="POST")
     def actions_check_all_betrusted():

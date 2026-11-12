@@ -697,6 +697,76 @@ def _trust_chains_section(state: SAPMAPState) -> list:
     return out
 
 
+def _blast_radius_section(state: SAPMAPState) -> list:
+    """Per-foothold blast radius + crown-jewel exposure (issue #197).
+
+    The chain table above enumerates *paths*; this answers the blunt
+    stakeholder question directly: from each foothold we hold, how much of
+    the landscape falls — and for each crown jewel, how many systems can
+    reach it.  Same reachable-set computation the GUI blast-radius view
+    renders (sapmap_chain.blast_radius / exposure_cone)."""
+    out = ["## Blast radius (reachable landscape per foothold)", ""]
+    try:
+        from sapmap_chain import blast_radius, exposure_cone
+    except Exception as e:
+        out.append(f"_Blast-radius analysis failed: {e}_")
+        out.append("")
+        return out
+
+    footholds = [
+        sid for sid, n in sorted(state.nodes.items())
+        if n.pwned or getattr(n, "gw_vulnerable", False)
+        or getattr(n, "ms_vulnerable", False)
+        or any(getattr(c, "verified", False) for c in (n.credentials or []))
+    ]
+    if not footholds:
+        out.append("_No footholds (compromised / exploitable / credentialed "
+                   "systems) to measure reach from._")
+        out.append("")
+        return out
+
+    out.append("From each established foothold, how many other systems fall "
+               "within reach — own this box, own all of *that* — by hop "
+               "distance:")
+    out.append("")
+    out.append("| Foothold | Reachable | Max hops | Ring breakdown (hop: count) |")
+    out.append("| --- | --- | --- | --- |")
+    rows = []
+    for sid in footholds:
+        r = blast_radius(state, sid, max_depth=6)
+        rings = "; ".join(f"{rr['hop']}: {len(rr['sids'])}"
+                          for rr in r["rings"]) or "—"
+        rows.append((r["reachable"], sid, r["max_hop"], rings))
+    for reachable, sid, max_hop, rings in sorted(rows, reverse=True):
+        out.append(f"| {_esc(sid)} | {reachable} | {max_hop} | {rings} |")
+    out.append("")
+
+    widest = max(rows)   # (reachable, sid, ...) — most-reaching foothold
+    if widest[0] > 0:
+        out.append(f"The widest-reaching foothold is **{_esc(widest[1])}** — "
+                   f"{widest[0]} system(s) within {widest[2]} hop(s). "
+                   f"Containing or hardening it shrinks the exposed surface "
+                   f"the most.")
+        out.append("")
+
+    jewels = [sid for sid, n in sorted(state.nodes.items())
+              if n.is_production]
+    if jewels:
+        out.append("### Crown-jewel exposure (who can reach each)")
+        out.append("")
+        out.append("The inverse view — for each production system, how many "
+                   "systems can reach it, and from how few hops away:")
+        out.append("")
+        out.append("| Crown jewel | Reachable by | Nearest (min hops) |")
+        out.append("| --- | --- | --- |")
+        for sid in jewels:
+            c = exposure_cone(state, sid, max_depth=6)
+            nearest = c["rings"][0]["hop"] if c["rings"] else "—"
+            out.append(f"| {_esc(sid)} | {c['reachable']} | {nearest} |")
+        out.append("")
+    return out
+
+
 def _per_system_table(state: SAPMAPState) -> list:
     """One-row-per-node landscape inventory."""
     out = ["## Landscape inventory", ""]
@@ -1328,6 +1398,60 @@ def _cert_auth_destinations_section(state: SAPMAPState) -> list:
             f"| {_esc(src)} | {_esc(dest)} | {_esc(url)} | "
             f"`{_esc(pse)}` | {_esc(tgt) if tgt else '—'} | "
             f"{'☁️' if is_btp else '—'} |")
+    out.append("")
+    return out
+
+
+def _snc_identity_section(state: SAPMAPState) -> list:
+    """Looted-PSE SNC client identities (issue #137 wallet).
+
+    Table one row per looted PSE: source SID, SNC identity (``p:CN=…``),
+    path (native vs CommonCryptoLib — derived from ``key_is_rsa`` with
+    ``path_pref`` override noted), the likely-reach SID count from the
+    STRUSTSSO2 trust-graph, active-flag, and loot time.  Empty when the
+    wallet is empty; no header noise.
+    """
+    wallet = getattr(state, "snc_credentials", {}) or {}
+    if not wallet:
+        return []
+    active_id = getattr(state, "active_snc_cred_id", "") or ""
+    out = ["## SNC client identity (looted PSEs)", ""]
+    out.append(
+        "A looted PSE pulled off a compromised SAP box can stand in as "
+        "the SNC *client* identity for RFC-over-SNC — the landscape's "
+        "SNC ACL already trusts it, so SAPMAP can speak RFC-over-SNC to "
+        "every system that trusts the source SID.  **The reach count "
+        "below is a trust-graph hint** (which systems' STRUSTSSO2 "
+        "accepts tickets signed by this identity) and is not a hard SNC "
+        "ACL guarantee — SNC acceptance also depends on "
+        "``snc/permit/*`` entries which SAPMAP does not yet model.")
+    out.append("")
+    out.append("| Active | Source SID | SNC identity | Path | Likely reach | Looted |")
+    out.append("| --- | --- | --- | --- | --- | --- |")
+    for cid in sorted(wallet.keys()):
+        c = wallet[cid]
+        pref = (c.path_pref or "auto").lower()
+        if pref == "native":
+            path = "native (forced)"
+        elif pref == "cryptolib":
+            path = "cryptolib (forced)"
+        else:   # auto
+            if c.key_is_rsa is True:
+                path = "native (RSA)"
+            elif c.key_is_rsa is False:
+                path = "cryptolib (EC)"
+            else:
+                path = "unprobed"
+        reach = state.reach_targets_for_snc_identity(c.source_sid or "")
+        reach_cell = (f"{len(reach)} ({', '.join(reach)})"
+                      if reach else "—")
+        is_active = (cid == active_id)
+        out.append(
+            f"| {'✓' if is_active else '—'} | "
+            f"{_esc(c.source_sid or '?')} | "
+            f"`{_esc(c.snc_identity or '?')}` | "
+            f"{_esc(path)} | {_esc(reach_cell)} | "
+            f"{_esc(c.looted_at or '?')} |")
     out.append("")
     return out
 
@@ -2843,6 +2967,9 @@ def build_markdown_report(state: SAPMAPState,
     sections.extend(_trust_chains_section(state))
     sections.append("---")
     sections.append("")
+    sections.extend(_blast_radius_section(state))
+    sections.append("---")
+    sections.append("")
     colocated_section = _colocated_section(state)
     if colocated_section:
         sections.extend(colocated_section)
@@ -2887,6 +3014,11 @@ def build_markdown_report(state: SAPMAPState,
         sections.append("---")
         sections.append("")
         sections.extend(cert_dest_section)
+    snc_identity_section = _snc_identity_section(state)
+    if snc_identity_section:
+        sections.append("---")
+        sections.append("")
+        sections.extend(snc_identity_section)
     for extra in (_impact_section(state),
                   _secstore_section(state),
                   _dbcon_section(state),
@@ -3293,6 +3425,96 @@ def _build_landscape_svg(state: SAPMAPState) -> str:
         + '</svg>'
     )
     return svg
+
+
+def _build_killchain_svg(chain) -> str:
+    """Inline SVG storyboard of ONE attack chain for the HTML report.
+
+    Renders the chain's ordered hops left-to-right: a box per system joined
+    by an arrow per hop, the arrow coloured by that hop's severity and
+    captioned with the technique (ChainHop.method).  Untested hops are drawn
+    dashed + faint.  Self-contained, no JS, responsive viewBox — the static
+    report counterpart of the animated GUI kill-chain player (#196).
+    """
+    hops = list(getattr(chain, "hops", None) or [])
+    sids = list(getattr(chain, "path_sids", None) or [])
+    if not hops or len(sids) < 2:
+        return ""
+    SEV_COLOR = {5: "#f85149", 4: "#db6d28", 3: "#d4a72c", 2: "#3fb950"}
+    box_w, box_h = 118, 52
+    gap = 150
+    mx, m_top, m_bot = 24, 74, 44
+    n = len(sids)
+    width = mx * 2 + n * box_w + (n - 1) * gap
+    height = m_top + box_h + m_bot
+    cy = int(m_top + box_h / 2)
+    end_prod = bool(getattr(chain, "end_is_production", False))
+
+    def _x(i):
+        return mx + i * (box_w + gap)
+
+    parts = [
+        f'<svg viewBox="0 0 {int(width)} {int(height)}" width="100%" '
+        f'style="max-width:100%;height:auto;background:#0d1117;'
+        f'border:1px solid #21262d;border-radius:8px" '
+        f'font-family="system-ui,Segoe UI,Roboto,sans-serif">'
+    ]
+    # Arrows (one per hop) — drawn before the boxes so the boxes overlay the
+    # arrow tails.
+    for i, hop in enumerate(hops):
+        if i + 1 >= n:
+            break
+        sev = int(getattr(hop, "severity", 2) or 2)
+        color = SEV_COLOR.get(sev, "#3fb950")
+        untested = bool(getattr(hop, "untested", False))
+        x1 = int(_x(i) + box_w)
+        x2 = int(_x(i + 1))
+        mid = int((x1 + x2) / 2)
+        dash = ' stroke-dasharray="7,5"' if untested else ''
+        op = '0.5' if untested else '1'
+        parts.append(
+            f'<line x1="{x1}" y1="{cy}" x2="{x2 - 11}" y2="{cy}" '
+            f'stroke="{color}" stroke-width="3"{dash} opacity="{op}"/>')
+        parts.append(
+            f'<path d="M {x2 - 11} {cy - 6} L {x2} {cy} L {x2 - 11} '
+            f'{cy + 6} Z" fill="{color}" opacity="{op}"/>')
+        method = str(getattr(hop, "method", "") or "")
+        label = method if len(method) <= 30 else method[:29] + "…"
+        italic = ' font-style="italic"' if untested else ''
+        parts.append(
+            f'<text x="{mid}" y="{cy - 15}" text-anchor="middle" '
+            f'font-size="11" font-weight="bold" fill="{color}"{italic}>'
+            f'<title>{_hesc(method)}</title>{_hesc(label)}</text>')
+        parts.append(
+            f'<text x="{mid}" y="{cy + 24}" text-anchor="middle" '
+            f'font-size="9" fill="#6b7280">hop {i + 1}</text>')
+    # Node boxes
+    for i, sid in enumerate(sids):
+        x = int(_x(i))
+        is_start = (i == 0)
+        is_end = (i == n - 1)
+        is_crown = is_end and end_prod
+        stroke = ('#f0883e' if is_start
+                  else '#f85149' if is_crown
+                  else '#58a6ff' if is_end
+                  else '#30363d')
+        sw = 2.5 if (is_start or is_end) else 1.2
+        parts.append(
+            f'<rect x="{x}" y="{m_top}" width="{box_w}" height="{box_h}" '
+            f'rx="8" fill="#161b22" stroke="{stroke}" stroke-width="{sw}"/>')
+        parts.append(
+            f'<text x="{x + box_w // 2}" y="{m_top + 22}" '
+            f'text-anchor="middle" font-size="13" font-weight="bold" '
+            f'fill="#c9d1d9" font-family="monospace">{_hesc(sid)}</text>')
+        role = ('★ entry' if is_start
+                else '\U0001f3af crown jewel' if is_crown
+                else 'target' if is_end
+                else 'pivot')
+        parts.append(
+            f'<text x="{x + box_w // 2}" y="{m_top + 40}" '
+            f'text-anchor="middle" font-size="9" fill="#8b949e">{role}</text>')
+    parts.append('</svg>')
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -4345,6 +4567,62 @@ def _html_cloud_lateral_section(state: SAPMAPState) -> str:
         + "".join(blocks) + '</section>')
 
 
+def _html_snc_identity_section(state: SAPMAPState) -> str:
+    """Looted-PSE SNC client identities (issue #137 wallet) — HTML sibling
+    of _snc_identity_section."""
+    wallet = getattr(state, "snc_credentials", {}) or {}
+    if not wallet:
+        return ""
+    active_id = getattr(state, "active_snc_cred_id", "") or ""
+    rows = []
+    for cid in sorted(wallet.keys()):
+        c = wallet[cid]
+        pref = (c.path_pref or "auto").lower()
+        if pref == "native":
+            path = "native (forced)"
+        elif pref == "cryptolib":
+            path = "cryptolib (forced)"
+        else:
+            if c.key_is_rsa is True:
+                path = "native (RSA)"
+            elif c.key_is_rsa is False:
+                path = "cryptolib (EC)"
+            else:
+                path = "unprobed"
+        reach = state.reach_targets_for_snc_identity(c.source_sid or "")
+        reach_cell = (f"{len(reach)} ({_hesc(', '.join(reach))})"
+                      if reach else "—")
+        is_active = (cid == active_id)
+        row_style = ' style="background:#fef3c7"' if is_active else ''
+        active_mark = '✓' if is_active else '—'
+        rows.append(
+            f'<tr{row_style}>'
+            f'<td style="text-align:center">{active_mark}</td>'
+            f'<td class="mono"><b>{_hesc(c.source_sid or "?")}</b></td>'
+            f'<td class="mono" style="font-size:11px;word-break:break-all;'
+            f'max-width:280px"><code>{_hesc(c.snc_identity or "?")}</code></td>'
+            f'<td>{_hesc(path)}</td>'
+            f'<td>{reach_cell}</td>'
+            f'<td style="font-size:11px">{_hesc(c.looted_at or "?")}</td>'
+            f'</tr>')
+    return (
+        '<section id="sec-snc-identity">'
+        '<h2>🔐 SNC client identity (looted PSEs)</h2>'
+        f'<p style="font-size:12px;color:#6b7280;margin:0 0 12px">'
+        f'{len(wallet)} looted PSE(s) available as the SNC client '
+        f'identity for RFC-over-SNC.  A looted PSE pulled off a '
+        f'compromised SAP box can stand in as the SNC client identity — '
+        f'the landscape\'s SNC ACL already trusts it.  The reach count '
+        f'is a <b>STRUSTSSO2 trust-graph hint</b> (not an SNC ACL '
+        f'guarantee: SNC acceptance also depends on <code>snc/permit/*'
+        f'</code> which SAPMAP does not yet model).</p>'
+        '<table class="grid">'
+        '<thead><tr><th>Active</th><th>Source SID</th>'
+        '<th>SNC identity</th><th>Path</th>'
+        '<th>Likely reach</th><th>Looted</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table></section>')
+
+
 def _html_cert_auth_destinations_section(state: SAPMAPState) -> str:
     """Cert-authenticated Type-G / H HTTP destinations."""
     rows_data: list[tuple[str, str, str, str, str, bool]] = []
@@ -4395,6 +4673,73 @@ def _html_cert_auth_destinations_section(state: SAPMAPState) -> str:
         '<th>PSE</th><th>Target node</th><th>BTP</th>'
         '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
         '</section>')
+
+
+def _html_blast_radius_section(state: SAPMAPState) -> str:
+    """Self-contained HTML for the blast-radius section (issue #197) — the
+    forward per-foothold reach table + the inverse crown-jewel exposure
+    table.  Returns '' when there are no footholds to measure from, so the
+    section (and its nav entry) drops out cleanly."""
+    try:
+        from sapmap_chain import blast_radius, exposure_cone
+    except Exception:
+        return ""
+    footholds = [
+        sid for sid, n in sorted(state.nodes.items())
+        if n.pwned or getattr(n, "gw_vulnerable", False)
+        or getattr(n, "ms_vulnerable", False)
+        or any(getattr(c, "verified", False) for c in (n.credentials or []))
+    ]
+    if not footholds:
+        return ""
+
+    fwd_rows = ""
+    data = []
+    for sid in footholds:
+        r = blast_radius(state, sid, max_depth=6)
+        rings = "; ".join(f"{rr['hop']}: {len(rr['sids'])}"
+                          for rr in r["rings"]) or "—"
+        data.append((r["reachable"], sid, r["max_hop"], rings))
+    for reachable, sid, max_hop, rings in sorted(data, reverse=True):
+        fwd_rows += (
+            f'<tr><td class="mono">{_hesc(sid)}</td>'
+            f'<td class="num">{reachable}</td>'
+            f'<td class="num">{max_hop}</td>'
+            f'<td>{_hesc(rings)}</td></tr>'
+        )
+
+    jewel_html = ""
+    jewels = [sid for sid, n in sorted(state.nodes.items()) if n.is_production]
+    if jewels:
+        jrows = ""
+        for sid in jewels:
+            c = exposure_cone(state, sid, max_depth=6)
+            nearest = c["rings"][0]["hop"] if c["rings"] else "—"
+            jrows += (
+                f'<tr><td class="mono">{_hesc(sid)}</td>'
+                f'<td class="num">{c["reachable"]}</td>'
+                f'<td class="num">{_hesc(str(nearest))}</td></tr>'
+            )
+        jewel_html = (
+            '<h3>Crown-jewel exposure (who can reach each)</h3>'
+            '<table class="grid"><thead><tr>'
+            '<th>Crown jewel</th><th>Reachable by</th><th>Nearest (min hops)</th>'
+            '</tr></thead><tbody>' + jrows + '</tbody></table>'
+        )
+
+    return (
+        '<section id="sec-blast">'
+        '<h2>💥 Blast radius (reachable landscape per foothold)</h2>'
+        '<p style="font-size:12px;color:#6b7280;margin:0 0 10px">'
+        'From each foothold, how much of the landscape falls — own this box, '
+        'own all of that — by hop distance.</p>'
+        '<table class="grid"><thead><tr>'
+        '<th>Foothold</th><th>Reachable</th><th>Max hops</th>'
+        '<th>Ring breakdown (hop: count)</th>'
+        '</tr></thead><tbody>' + fwd_rows + '</tbody></table>'
+        + jewel_html +
+        '</section>'
+    )
 
 
 def build_html_report(state: SAPMAPState,
@@ -4470,6 +4815,7 @@ def build_html_report(state: SAPMAPState,
 
     # Trust chains
     chain_rows_html = ""
+    killchain_svg_html = ""
     chain_count = 0
     prd_chain_count = 0
     try:
@@ -4478,6 +4824,18 @@ def build_html_report(state: SAPMAPState,
                                  print_fn=lambda *a, **kw: None)
         chain_count = len(chains)
         prd_chain_count = sum(1 for c in chains if c.end_is_production)
+        # Static storyboard of the highest-severity path (#196) — prefer a
+        # production-reaching chain, else the top-ranked one.
+        _top = next((c for c in chains if c.end_is_production),
+                    chains[0] if chains else None)
+        if _top is not None:
+            _svg = _build_killchain_svg(_top)
+            if _svg:
+                killchain_svg_html = (
+                    '<p style="font-size:12px;color:#6b7280;margin:0 0 10px">'
+                    'Highest-severity attack path, hop by hop — arrow '
+                    'colour marks per-hop severity; a dashed arrow is an '
+                    'unvalidated hop.</p>' + _svg)
         for c in chains[:30]:
             risk_color = {
                 "CRITICAL": "#f85149",
@@ -4820,8 +5178,10 @@ def build_html_report(state: SAPMAPState,
     btp_section_html = _html_btp_section(state)
     cloud_lat_section_html = _html_cloud_lateral_section(state)
     cert_dest_section_html = _html_cert_auth_destinations_section(state)
+    snc_identity_section_html = _html_snc_identity_section(state)
     attack_coverage_html = _html_attack_coverage_section(state)
     compliance_coverage_html = _html_compliance_coverage_section(state)
+    blast_radius_section_html = _html_blast_radius_section(state)
     colocated_section_html = _html_colocated_section(state)
     med_info_html = _html_medium_info_findings_section(state)
     created_users_html = _html_created_users_section(state)
@@ -4842,6 +5202,8 @@ def build_html_report(state: SAPMAPState,
         ("sec-critical",      "🛑 Critical findings",     True),
         ("sec-high",          "⚠️ High findings",         True),
         ("sec-chains",        "🔗 Trust chains",          True),
+        ("sec-blast",         "💥 Blast radius",
+                              bool(blast_radius_section_html)),
         ("sec-colocated",     "🏠 Same-host co-located",
                               bool(colocated_section_html)),
         ("sec-pwspray",       "🔓 Password spraying",
@@ -4860,6 +5222,8 @@ def build_html_report(state: SAPMAPState,
                               bool(cloud_lat_section_html)),
         ("sec-certauth",      "🔐 Cert-auth HTTP destinations",
                               bool(cert_dest_section_html)),
+        ("sec-snc-identity",  "🔐 SNC client identity (looted PSEs)",
+                              bool(snc_identity_section_html)),
         ("sec-medinfo",       "ℹ️ Medium & informational findings",
                               bool(med_info_html)),
         ("sec-impact",        "💰 Business impact",
@@ -5101,10 +5465,13 @@ def build_html_report(state: SAPMAPState,
 
   <section id="sec-chains">
     <h2>🔗 Lateral movement / trust chains ({chain_count})</h2>
+    {killchain_svg_html}
     <table class="grid"><thead><tr>
       <th>Risk</th><th>Path</th><th>Hops</th><th>PRD</th><th>Entry</th>
     </tr></thead><tbody>{chain_rows_html}</tbody></table>
   </section>
+
+  {blast_radius_section_html}
 
   {colocated_section_html}
 
@@ -5139,6 +5506,7 @@ def build_html_report(state: SAPMAPState,
   {cloud_lat_section_html}
 
   {cert_dest_section_html}
+  {snc_identity_section_html}
 
   {med_info_html}
 

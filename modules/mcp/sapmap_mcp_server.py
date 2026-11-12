@@ -286,10 +286,34 @@ def get_findings() -> str:
 @mcp.tool()
 def get_attack_chains() -> str:
     """Analyze and return RFC trust-chain attack paths across the landscape.
-    Shows how lateral movement can reach production systems."""
+    Shows how lateral movement can reach production systems.  Each chain's
+    ordered `hops` carry a per-hop `method` (the technique), `severity`
+    (5=CRITICAL..2=LOW) and `untested` flag, so a caller can reason about or
+    render the path step by step."""
     _api("POST", "/api/actions/analyze_chains", {})
     _wait_for_tasks(timeout=60)
     resp = _api("GET", "/api/chains")
+    return json.dumps(resp, indent=2)
+
+
+@mcp.tool()
+def get_blast_radius(sid: str, mode: str = "forward") -> str:
+    """Flood one system's reachable set over the RFC/trust graph (issue #197).
+
+    Where get_attack_chains enumerates ranked paths, this answers the blunt
+    question directly.  mode='forward' (default) returns every system
+    reachable FROM `sid` — own this box, own all of that; mode='inverse'
+    returns every system that can reach `sid` (the crown-jewel exposure
+    cone).  The result groups nodes into shortest-distance `rings` and
+    carries, per node, `hop` / `method` / `severity` / `untested` / `via`,
+    plus `reachable` and `max_hop` totals.  Read-only — no exploitation.
+
+    Args:
+        sid: the system to flood from (forward) or to (inverse)
+        mode: 'forward' or 'inverse'
+    """
+    resp = _api("POST", "/api/actions/blast_radius",
+                {"sid": sid, "mode": mode})
     return json.dumps(resp, indent=2)
 
 
@@ -338,6 +362,43 @@ def set_credentials(sid: str, username: str, password: str,
         "username": username, "password": password,
         "client": str(client),
     }))
+
+
+@mcp.tool()
+def list_snc_identities() -> str:
+    """List looted-PSE SNC client identities in the wallet + the active one.
+
+    Issue #137 — a PSE pulled off a pwned box can stand in as the SNC
+    client identity so RFC-over-SNC speaks to every system that trusts
+    it.  The wallet is populated automatically by the forge chain when a
+    PSE is looted.  PINs are never returned.
+    """
+    return json.dumps(_api("GET", "/api/snc/wallet"))
+
+
+@mcp.tool()
+def set_snc_identity(cred_id: str = "", source_sid: str = "") -> str:
+    """Activate a looted PSE as the active SNC client identity (#137).
+
+    Args:
+        cred_id: Wallet key (canonical selector), e.g. "S4H:SAPSYS".
+        source_sid: Convenience — resolves to the unique PSE looted
+            from that SID.  Errors if the box yielded >1 PSE; pass
+            cred_id explicitly in that case.
+
+    Passing neither (both empty) reverts to the operator posture
+    (same as clear_snc_identity below).
+    """
+    return json.dumps(_api("POST", "/api/snc/wallet/activate", {
+        "cred_id": cred_id or "",
+        "source_sid": (source_sid or "").strip().upper(),
+    }))
+
+
+@mcp.tool()
+def clear_snc_identity() -> str:
+    """Revert to the operator-posture SNC identity (no looted PSE active)."""
+    return json.dumps(_api("POST", "/api/snc/wallet/clear"))
 
 
 @mcp.tool()

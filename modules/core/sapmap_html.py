@@ -1138,6 +1138,9 @@ body {
       <div class="dd-item" onclick="layoutStar()">&#10024; Layout: Star (hub &amp; spoke)</div>
       <div class="dd-item" onclick="layoutHierarchy()">&#128719; Layout: Hierarchy (top &rarr; bottom by RFC)</div>
       <div class="dd-item" onclick="layoutByStack()">&#128218; Layout: Group by Stack (ABAP / Java / Dual)</div>
+      <div class="dd-item" id="defense-rings-item" onclick="toggleDefenseRings()" title="Defense-in-depth rings layout (issue #198).  Centres the crown jewel (the deepest production system from an entry) and arranges every system in concentric rings by exploit distance — the shortest hop count from an internet-facing / compromised / credentialed entry.  Entry points sit on the outer ring; each ring inward is one more hop; nodes with no path from an entry sit in a separated outer band.  One glance shows whether production is 1 hop from the edge or 5.  Toggle off to restore your previous layout.">&#127919; Layout: Defense-in-Depth Rings</div>
+      <div class="dd-sep"></div>
+      <div class="dd-item" id="blast-mode-item" onclick="toggleBlastMode()" title="Blast-radius explore mode (issue #197).  While ON, LEFT-click a node to flood everything it can reach, RIGHT-click to flood everything that can reach it (the crown-jewel exposure cone).  Node dragging is suspended while the mode is on.  Right-click any node's context menu also has 'Blast Radius' / 'Exposure Cone' entries that work with the mode off.">&#128165; Blast-Radius Mode: Off</div>
       <div class="dd-sep"></div>
       <div class="dd-item" onclick="toggleConsole()">&#128203; Toggle Console</div>
     </div>
@@ -1251,6 +1254,14 @@ body {
     <svg id="pulse-svg" xmlns="http://www.w3.org/2000/svg"
          style="position:absolute;inset:0;width:100%;height:100%;
                 pointer-events:none;z-index:5"></svg>
+    <!-- Blast-radius legend / counter (issue #197).  Populated + shown by
+         _renderBlastLegend(); hidden until a flood runs.  pointer-events
+         on so the clear (x) button is clickable; sits above the pulse. -->
+    <div id="blast-legend" style="display:none;position:absolute;left:12px;
+         bottom:12px;z-index:6;max-width:300px;background:rgba(13,17,23,0.92);
+         border:1px solid #30363d;border-radius:8px;padding:10px 12px;
+         font-size:12px;color:#c9d1d9;box-shadow:0 4px 16px rgba(0,0,0,0.5)">
+    </div>
   </div>
 
   <!-- Legend — collapsed bar (click LEGEND to expand modal) -->
@@ -1283,6 +1294,7 @@ body {
     </span>
     <span style="flex:1"></span>
     <label style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:2px 10px;border:1px solid #30363d;border-radius:4px;background:#161b22;color:#c9d1d9;font-size:11px"><input type="checkbox" id="show-unknown" style="accent-color:#f0883e;width:14px;height:14px" onchange="updateMap()"> Show unknown targets</label>
+    <label title="Hide the DBCON database cylinders and STMS transport trucks to de-clutter the map" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:2px 10px;border:1px solid #30363d;border-radius:4px;background:#161b22;color:#c9d1d9;font-size:11px"><input type="checkbox" id="hide-satellites" style="accent-color:#f0883e;width:14px;height:14px" onchange="updateMap()"> Hide STMS &amp; DB</label>
   </div>
 
   <!-- Legend — full modal.  Groups every edge/node style into sections
@@ -1302,7 +1314,7 @@ body {
           <div class="legend-row"><span class="swatch-cell"><span class="legend-swatch" style="background:#4a1a1a;border:1px solid #8b0000;width:22px;height:14px"></span></span><span class="label"><b>PRD system</b> — red-tinted box, treat any finding as blocking</span></div>
           <div class="legend-row"><span class="swatch-cell"><span class="legend-swatch" style="background:#4a3a1a;border:1px solid #e67e22;width:22px;height:14px"></span></span><span class="label"><b>Non-PRD system</b> — dev / QA / test tier</span></div>
           <div class="legend-row"><span class="swatch-cell"><span class="legend-swatch" style="background:transparent;border:2px solid #8b0000;width:22px;height:14px"></span></span><span class="label"><b>Critical finding</b> — thick red border on any node</span></div>
-          <div class="legend-row"><span class="swatch-cell" style="font-size:16px">&#9889;</span><span class="label"><b>Pwned</b> — SAPMAP has created a user or captured shell</span></div>
+          <div class="legend-row"><span class="swatch-cell"><span style="display:inline-block;background:#8b0000;color:#fff;font-size:8px;font-weight:bold;letter-spacing:0.5px;padding:1px 4px;border-radius:3px;border:1px solid #0d1117">POWNED</span></span><span class="label"><b>Pwned</b> — SAPMAP has created a user or captured shell</span></div>
           <div class="legend-row"><span class="swatch-cell"><span class="legend-swatch" style="background:#046c7a;width:22px;height:14px;clip-path:polygon(15% 0,85% 0,100% 50%,85% 100%,15% 100%,0 50%)"></span></span><span class="label"><b>SAP Cloud Connector</b> — hexagonal teal node</span></div>
           <div class="legend-row"><span class="swatch-cell"><span class="legend-swatch" style="background:#4d9eb6;width:22px;height:14px"></span></span><span class="label"><b>Web Dispatcher</b> — cyan node with backend fan-out</span></div>
           <div class="legend-row"><span class="swatch-cell"><span style="color:#a371f7;font-size:16px">&#9729;</span></span><span class="label"><b>BTP subaccount</b> — cloud shape, one per subaccount</span></div>
@@ -1394,6 +1406,8 @@ body {
   <!-- Top-level quick actions -->
   <div class="ctx-item" data-action="details">&#128269; View System Details</div>
   <div class="ctx-item" data-action="findings">&#128203; View Findings</div>
+  <div class="ctx-item" data-action="blast_radius_forward" title="Flood every system reachable FROM this node, ring by ring, colour-graded by hop distance (issue #197).  'Own this box, own all of that.'  Read-only view over the RFC/trust graph — no exploitation.">&#128165; Blast Radius (reachable from here)</div>
+  <div class="ctx-item" data-action="blast_radius_inverse" title="Flood every system that can reach THIS node — the exposure cone of a crown jewel (issue #197).  'Who can get to me?'  Read-only view over the RFC/trust graph.">&#127919; Exposure Cone (who can reach this)</div>
   <div class="ctx-item write-op" data-action="wd_admin_creds">&#128273; Add WD admin credentials (webadm / pull backend table)</div>
   <div class="ctx-item" data-action="credentials">&#128273; Provide Credentials</div>
   <div class="ctx-item" data-action="remove_credentials">&#128465;&#65039; Remove Credentials</div>
@@ -1405,6 +1419,7 @@ body {
       <div class="ctx-item" data-action="standard_scan">&#128270; Standard Scan (fingerprint host)</div>
       <div class="ctx-item write-op" data-action="analyse_capabilities">&#128201; Analyse User Capabilities</div>
       <div class="ctx-item" data-action="rfc_system_info">&#128225; RFC System Info</div>
+      <div class="ctx-item" data-action="check_snc" title="Re-probe this system's SNC posture (enabled / enforced / QoP) via the DIAG or SAProuter SNC fingerprint. Same as the 'Re-probe SNC' button in System Details.">&#128274; Re-probe SNC Posture</div>
       <div class="ctx-item" data-action="check_gw">&#128270; Check GW Vulnerability</div>
       <div class="ctx-item" data-action="check_ms">&#128270; Check MS Betrusted &mdash; 10KBlaze (CVE-2020-6207)</div>
       <div class="ctx-item" data-action="check_cve_58240">&#128270; Check CVE-2026-58240 (MS ASCS_GW rogue reg.)</div>
@@ -1608,6 +1623,7 @@ body {
       <div class="ctx-item" data-action="set_instance_nr">&#9881; Set Instance Number</div>
       <div class="ctx-item" data-action="set_saprouter">&#128268; Set SAProuter</div>
       <div class="ctx-item" data-action="set_snc_name">&#128272; Add SNC Name</div>
+      <div class="ctx-item" data-action="use_pse_as_snc" title="Use this box's looted SAPSYS.pse as our SNC client identity (#137). Only shown when a PSE from this node is in the wallet.">&#128273; Use this PSE as SNC identity</div>
       <div class="ctx-item" data-action="set_telnet_override">&#128279; Set Telnet Endpoint (SSH tunnel)</div>
     </div>
   </div>
@@ -2364,12 +2380,29 @@ body {
 
 <!-- Configure SNC Modal -->
 <div class="modal-overlay" id="snc-config-modal">
-  <div class="modal" style="max-width:560px">
+  <div class="modal" style="max-width:640px">
     <h3>&#128274; Configure SNC</h3>
     <div style="font-size:12px;color:#8b949e;margin-bottom:12px;line-height:1.5">
       Secure Network Communications (SNC) requires the SAP Cryptographic
       Library and a configured <code>SECUDIR</code>.  The checks below reflect
       the environment of the running SAPMAP process.
+    </div>
+    <!-- #137 PR2: Active SNC client identity + looted-PSE wallet -->
+    <div id="snc-active-identity-block" style="margin-bottom:14px;padding:10px 12px;background:#0d1117;border:1px solid #30363d;border-radius:4px">
+      <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Active SNC client identity</div>
+      <div id="snc-active-identity" style="font-family:monospace;font-size:12px;color:#c9d1d9;word-break:break-all;overflow-wrap:anywhere">&mdash;</div>
+      <div id="snc-active-path-row" style="margin-top:6px;font-size:11px;color:#8b949e">path: <span id="snc-active-path">&mdash;</span></div>
+      <div id="snc-active-reach-row" style="margin-top:6px;font-size:11px;color:#8b949e;display:none">likely reach: <span id="snc-active-reach" style="color:#c9d1d9"></span></div>
+      <div style="margin-top:8px">
+        <label style="font-size:11px;color:#8b949e">Switch to looted PSE</label>
+        <select id="snc-wallet-select" style="width:100%;margin-top:4px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:4px 6px;font-family:monospace;font-size:12px">
+          <option value="">— operator posture (no looted PSE) —</option>
+        </select>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:6px">
+        <button class="btn" style="font-size:11px;padding:4px 10px" onclick="activateSelectedSncWalletEntry()">Activate selection</button>
+        <button class="btn" style="font-size:11px;padding:4px 10px" onclick="clearActiveSncIdentity()">Revert to operator</button>
+      </div>
     </div>
     <div class="form-row">
       <label>SECUDIR</label>
@@ -4309,6 +4342,8 @@ async function pollUpdates() {
           else if (c.cmd === 'show_chains') { const r = await fetch('/api/chains'); const d = await r.json(); showChainResults(d.chains || []); }
           else if (c.cmd === 'show_detail') showSystemDetail(c.sid);
           else if (c.cmd === 'highlight_chain') highlightChain(c.path_sids);
+          else if (c.cmd === 'play_chain') playChainData(c.chain);
+          else if (c.cmd === 'blast_radius') floodBlastRadius(c.sid, c.mode);
           else if (c.cmd === 'relayout') {
             const m = (c.mode || '').toLowerCase();
             if      (m === 'circle')     layoutCircle();
@@ -4316,6 +4351,9 @@ async function pollUpdates() {
             else if (m === 'hierarchy')  layoutHierarchy();
             else if (m === 'stack'
                   || m === 'by_stack')   layoutByStack();
+            else if (m === 'rings'
+                  || m === 'defense'
+                  || m === 'defense_rings') layoutDefenseRings();
             else if (m === 'reset')      resetLayout();
             else console.warn('relayout: unknown mode', c.mode);
           }
@@ -4612,6 +4650,10 @@ function updateMap() {
 
   // Collect unknown targets when checkbox is on
   const showUnknown = document.getElementById('show-unknown') && document.getElementById('show-unknown').checked;
+  // Issue #191: operator de-clutter toggle — hides every DBCON cylinder
+  // and TMS truck (and their connecting edges + host-zone contribution).
+  const hideSatellites = !!(document.getElementById('hide-satellites')
+                            && document.getElementById('hide-satellites').checked);
   const unknownTargets = {};  // host -> { _x, _y, label }
   if (showUnknown) {
     let unkIdx = 0;
@@ -4756,21 +4798,25 @@ function updateMap() {
       // the zone excludes it; next render picks it up (positions
       // are computed + persisted during the DBCON drawing loop
       // further down in this render, and the next poll re-enters
-      // this block).
-      for (const edge of (n.dbcon_edges || [])) {
-        const pk = sid + '|' + edge.con_name;
-        const p = dbconPositions[pk];
-        if (p) addToZone(k, p._x, p._y,
-                          _DB_ACCESSORY_W, _DB_ACCESSORY_H,
-                          `dbcon:${edge.con_name}`, 'dbcon');
-      }
-      // TMS trucks — same story.
-      for (const dest of (n.tms_destinations || [])) {
-        const pk = 'tms:' + sid + '|' + dest.target_sid + '|' + dest.domain;
-        const p = tmsPositions[pk];
-        if (p) addToZone(k, p._x, p._y,
-                          _TMS_ACCESSORY_W, _TMS_ACCESSORY_H,
-                          `tms:${dest.target_sid}`, 'tms');
+      // this block).  Skipped when the operator has hidden the
+      // accessories (#191) so the host zone doesn't balloon around
+      // the empty space they would have occupied.
+      if (!hideSatellites) {
+        for (const edge of (n.dbcon_edges || [])) {
+          const pk = sid + '|' + edge.con_name;
+          const p = dbconPositions[pk];
+          if (p) addToZone(k, p._x, p._y,
+                            _DB_ACCESSORY_W, _DB_ACCESSORY_H,
+                            `dbcon:${edge.con_name}`, 'dbcon');
+        }
+        // TMS trucks — same story.
+        for (const dest of (n.tms_destinations || [])) {
+          const pk = 'tms:' + sid + '|' + dest.target_sid + '|' + dest.domain;
+          const p = tmsPositions[pk];
+          if (p) addToZone(k, p._x, p._y,
+                            _TMS_ACCESSORY_W, _TMS_ACCESSORY_H,
+                            `tms:${dest.target_sid}`, 'tms');
+        }
       }
     });
     Object.entries(sccNodes).forEach(([host, sn]) => {
@@ -5522,14 +5568,10 @@ function updateMap() {
       }
     }
 
-    // Lightning bolt for pwned — sits in the top-right corner, partly
+    // POWNED tag for pwned — hangs off the top-right corner, partly
     // outside the box (mirror of the finding badge in the top-left).
     if (n.pwned) {
-      const lx = x + BOX_W + 2, ly = y - 2;
-      html += `<text x="${lx}" y="${ly}" font-size="28" fill="#f0883e"`
-        + ` stroke="#0d1117" stroke-width="2.5" paint-order="stroke"`
-        + ` text-anchor="middle" dominant-baseline="middle"`
-        + ` font-weight="bold" pointer-events="none">&#9889;</text>`;
+      html += pwnedTagSvg(x + BOX_W + 8, y);
     }
     // Root badge — shown when ANY of the Linux LPE techniques
     // (Copy Fail / pedit-COW / Dirty Frag) has obtained root.
@@ -5767,13 +5809,9 @@ function updateMap() {
     // Title — "SCC" label only (host moves into body like SAP nodes)
     html += `<text x="${x+cut+4}" y="${y+18}" fill="#fff" font-size="13" font-weight="bold" font-family="monospace">SCC</text>`;
 
-    // Pwned bolt (top-right, mirroring SAP nodes)
+    // POWNED tag (top-right, mirroring SAP nodes)
     if (sn.pwned) {
-      const lx = x + BOX_W + 2, ly = y - 2;
-      html += `<text x="${lx}" y="${ly}" font-size="28" fill="#f0883e"`
-           + ` stroke="#0d1117" stroke-width="2.5" paint-order="stroke"`
-           + ` text-anchor="middle" dominant-baseline="middle"`
-           + ` font-weight="bold" pointer-events="none">&#9889;</text>`;
+      html += pwnedTagSvg(x + BOX_W + 8, y);
     }
 
     // Body lines — host first (IP or hostname), then details
@@ -5873,13 +5911,9 @@ function updateMap() {
          + `fill="#5dade2" font-size="14" font-weight="bold" `
          + `font-family="monospace" pointer-events="none">&#9729; BTP</text>`;
 
-    // Pwned bolt (top-right)
+    // POWNED tag (top-right)
     if (bn.pwned) {
-      const lx = x + BOX_W - 10, ly = y + 18;
-      html += `<text x="${lx}" y="${ly}" font-size="28" fill="#f0883e"`
-           + ` stroke="#0d1117" stroke-width="2.5" paint-order="stroke"`
-           + ` text-anchor="middle" dominant-baseline="middle"`
-           + ` font-weight="bold" pointer-events="none">&#9889;</text>`;
+      html += pwnedTagSvg(x + BOX_W + 2, y + 10);
     }
 
     // Body lines — region / subdomain / counts
@@ -5931,6 +5965,7 @@ function updateMap() {
   // user on the target via direct SQL.
   const DB_BOX_W = 150, DB_BOX_H = 100;
   Object.values(nodes).forEach(src => {
+    if (hideSatellites) return;        // #191: operator hid DB/STMS accessories
     const edges = src.dbcon_edges || [];
     if (!edges.length) return;
     // Stack DBCON nodes vertically BELOW the source.  Prior versions
@@ -6183,12 +6218,9 @@ function updateMap() {
              + `font-family="Arial,sans-serif" `
              + `pointer-events="none">SAP</text>`;
       }
-      // Lightning bolt on pwn
+      // POWNED tag on pwn
       if (e.pwned) {
-        html += `<text x="${x + DB_BOX_W - 10}" y="${y + 18}" font-size="26" `
-             + `fill="#f0883e" stroke="#0d1117" stroke-width="2.5" paint-order="stroke" `
-             + `text-anchor="middle" dominant-baseline="middle" font-weight="bold" `
-             + `pointer-events="none">&#9889;</text>`;
+        html += pwnedTagSvg(x + DB_BOX_W + 6, y + 10);
       }
       html += '</g>';
     });
@@ -6201,6 +6233,7 @@ function updateMap() {
   // ===================================================================
   const TMS_BOX_W = 160, TMS_BOX_H = 100;
   Object.values(nodes).forEach(src => {
+    if (hideSatellites) return;        // #191: operator hid DB/STMS accessories
     const dests = src.tms_destinations || [];
     if (!dests.length) return;
     // Stack TMS trucks vertically BELOW the source, in a column
@@ -6426,10 +6459,7 @@ function updateMap() {
              + `pointer-events="none">CTRL</text>`;
       }
       if (e.pwned) {
-        html += `<text x="${x + TMS_BOX_W - 10}" y="${y + 18}" font-size="26" `
-             + `fill="#f0883e" stroke="#0d1117" stroke-width="2.5" paint-order="stroke" `
-             + `text-anchor="middle" dominant-baseline="middle" font-weight="bold" `
-             + `pointer-events="none">&#9889;</text>`;
+        html += pwnedTagSvg(x + TMS_BOX_W + 6, y + 10);
       }
       html += '</g>';
     });
@@ -6559,6 +6589,9 @@ function updateMap() {
   // pulsing overlay we attached in filterMapToSids(), shortening the
   // visible effect to ~0.5s.
   try { _reapplyAttackHighlights(); } catch (_) {}
+  // Likewise re-attach the blast-radius ring outlines (#197) the rewrite
+  // just wiped, so the flood view survives every state poll.
+  try { _reapplyBlast(); } catch (_) {}
 }
 
 // --- Event handlers ---
@@ -6583,6 +6616,23 @@ function downloadCsv(sid, scenario) {
       }
     })
     .catch(err => alert('Export error: ' + err));
+}
+
+// Issue #178: a red "POWNED" badge replaces the ⚡ lightning glyph as the
+// pwned marker on map nodes — a tag reads more clearly at a glance than a
+// bolt.  Draws a rounded-rect badge whose RIGHT edge sits at `rightX` and
+// which is vertically centred on `midY` (so callers pass the node's
+// top-right corner, matching where the old bolt hung).  Dark stroke +
+// paint-order:stroke keep it legible over any node colour; non-interactive.
+function pwnedTagSvg(rightX, midY) {
+  const w = 46, h = 15, r = 3;
+  const bx = rightX - w, by = midY - h / 2;
+  return `<rect x="${bx}" y="${by}" width="${w}" height="${h}" rx="${r}"`
+    + ` fill="#8b0000" stroke="#0d1117" stroke-width="1.5" paint-order="stroke"`
+    + ` pointer-events="none"/>`
+    + `<text x="${bx + w / 2}" y="${by + h / 2 + 0.5}" text-anchor="middle"`
+    + ` dominant-baseline="middle" font-size="9.5" font-weight="bold"`
+    + ` fill="#ffffff" letter-spacing="0.6" pointer-events="none">POWNED</text>`;
 }
 
 function escHtml(s) {
@@ -6811,6 +6861,9 @@ function getSuggestedActions(n, sid) {
 function showCtxMenu(e, sid) {
   e.preventDefault();
   e.stopPropagation();
+  // Blast-Radius Mode (#197): a right-click floods who can reach this node
+  // (the exposure cone) instead of opening the context menu.
+  if (_blastMode) { floodBlastRadius(sid, 'inverse'); return; }
   hideMapCtxMenu();
   hideSCCCtxMenu();
   hideBTPCtxMenu();
@@ -6973,6 +7026,16 @@ function showCtxMenu(e, sid) {
   const hasDispPort = n && (n.instances || []).some(i =>
     Object.entries(i.ports || {}).some(
       ([p,s]) => s === 'dispatcher' || (p >= 3200 && p <= 3299)));
+
+  // #137 PR2 — SNC client identity.  "Use this PSE as SNC identity"
+  // only makes sense when this node's looted PSE is already in the
+  // wallet (populated by the forge chain).  The wallet IS authoritative
+  // — sapsys_cert_subject_dn alone means a cert was parsed but may not
+  // carry the cred_id the activate route needs.
+  const walletCredForNode = (sid && mapState && mapState.snc_credentials)
+    ? Object.values(mapState.snc_credentials).find(c => c && c.source_sid === sid)
+    : null;
+  const hasLootedPseInWallet = !!walletCredForNode;
 
   // Enable/disable rules per action
   const rules = {
@@ -7296,6 +7359,7 @@ function showCtxMenu(e, sid) {
     'router_scan':      true,                       // always (probes via SAProuter, no creds)
     'set_saprouter':    true,                       // always available
     'set_snc_name':     true,                       // always available
+    'use_pse_as_snc':   hasLootedPseInWallet,        // #137 — only when this node's PSE is in the wallet
     'set_telnet_override': isJavaStack,              // only meaningful for Java stacks
     'delete_system':    true,                       // always available
   };
@@ -7689,6 +7753,9 @@ function showCtxMenu(e, sid) {
     // Note: harvest_btp_creds is gated above (alongside check_ms)
     // — moved next to the WD-context block since the gating logic
     // shares the same "needs a usable RFC logon" requirement.
+    // #137 PR2 — hide "Use this PSE as SNC identity" when this node's
+    // PSE isn't in the wallet; the ctx-menu item is noise otherwise.
+    'use_pse_as_snc':     !hasLootedPseInWallet,
   };
 
   // Apply visibility + enable/disable state to each menu item
@@ -8989,6 +9056,8 @@ async function ctxAction(action) {
   switch (action) {
     case 'details': showDetails(sid); break;
     case 'findings': showFindings(sid); break;
+    case 'blast_radius_forward': floodBlastRadius(sid, 'forward'); break;
+    case 'blast_radius_inverse': floodBlastRadius(sid, 'inverse'); break;
     case 'credentials': showCredModal(sid); break;
     case 'remove_credentials': showRemoveCredsModal(sid); break;
     case 'rfc_system_info':
@@ -10262,6 +10331,7 @@ async function ctxAction(action) {
       break;
     case 'set_saprouter': showSaprouterModal(sid); break;
     case 'set_snc_name': showSncNameModal(sid); break;
+    case 'use_pse_as_snc': useLootedPseAsSncIdentity(sid); break;
     case 'harvest_scc': {
       const nh = (mapState.nodes || {})[sid];
       const canHarvest = nh && (nh.gw_vulnerable || nh.cve_2025_31324_vulnerable);
@@ -10607,6 +10677,7 @@ function showConnInfo(e, connIdx) {
     <h3>${connLabel} Connection Details</h3>
     <div class="info-row"><span class="info-label">Source:</span><span class="info-val">${escHtml(conn.source_sid)} (${escHtml(conn.source_host)})</span></div>
     <div class="info-row"><span class="info-label">Target:</span><span class="info-val">${escHtml(conn.target_sid || '?')} (${escHtml(conn.target_host || '?')})</span></div>
+    ${conn.reported_ip && conn.reported_ip !== conn.target_host && conn.reported_ip !== conn.target_ip ? `<div class="info-row"><span class="info-label">Internal IP:</span><span class="info-val" style="color:#8b949e" title="The target's self-reported IP (RFC_SYSTEM_INFO RFCIPADDR) — internal / NAT, not routable from here.">${escHtml(conn.reported_ip)} <span style="font-size:10px">(not routable)</span></span></div>` : ''}
     <div class="info-row"><span class="info-label">Destination:</span><span class="info-val">${escHtml(conn.destination_name)} (Type ${connType})</span></div>
     ${isHttp ? `
       <div class="info-row"><span class="info-label">URL:</span><span class="info-val" style="word-break:break-all">${escHtml(conn.http_url || '?')}</span></div>
@@ -11375,6 +11446,7 @@ function showDetails(sid, opts) {
       <div class="detail-row"><span class="detail-key">Type</span><span class="detail-val">${escHtml(n.system_type)}</span></div>
       <div class="detail-row"><span class="detail-key">Hostname</span><span class="detail-val">${escHtml(n.hostname)}</span></div>
       <div class="detail-row"><span class="detail-key">IP</span><span class="detail-val">${escHtml(n.ip)}</span></div>
+      ${n.reported_ip && n.reported_ip !== n.ip ? `<div class="detail-row"><span class="detail-key">Reported IP</span><span class="detail-val" style="color:#8b949e" title="The system's own view of its IP (RFC_SYSTEM_INFO RFCIPADDR). Often an internal / NAT address (e.g. Docker 172.17.x) — may not be routable from here. SAPMAP connects via the IP above.">${escHtml(n.reported_ip)} <span style="font-size:10px;color:#6e7681">(internal)</span></span></div>` : ''}
       <div class="detail-row"><span class="detail-key">OS</span><span class="detail-val">${escHtml(n.os_type)}</span></div>
       <div class="detail-row"><span class="detail-key">Database</span><span class="detail-val">${escHtml(n.db_type)}</span></div>
       <div class="detail-row"><span class="detail-key">Kernel</span><span class="detail-val">${escHtml(n.kernel)}</span></div>
@@ -11431,7 +11503,6 @@ function showDetails(sid, opts) {
             : 'Not checked'
       }</span></div>` : ''}
       ${n.saprouter ? `<div class="detail-row"><span class="detail-key">SAProuter</span><span class="detail-val" style="color:#d29922">${escHtml(n.saprouter)}</span></div>` : ''}
-      ${n.snc_partnername ? `<div class="detail-row"><span class="detail-key">SNC Name</span><span class="detail-val" style="color:#d29922">${escHtml(n.snc_partnername)}</span></div>` : ''}
 
       ${n.java_secstore_checked ? `
       <div class="detail-row"><span class="detail-key">Java Secure Store</span><span class="detail-val">${
@@ -11657,17 +11728,27 @@ function showDetails(sid, opts) {
     })()}
     ${(() => {
       const s = n.snc_info || {};
-      if (!s.checked) return '';
+      const sncName = (n.snc_partnername || '').trim();
+      if (!s.checked && !sncName) return '';
       const sid = n.sid;
+      const nameRow = sncName
+        ? '<div class="detail-row"><span class="detail-key" title="SNC partner identity (snc_partnername). Harvested unauthenticated from the Message Server /msgserver/text/logon access-point list, or operator-set. Used as the partner name for authenticated SNC RFC.">SNC name</span><span class="detail-val" style="font-family:monospace;font-size:11px;color:#58a6ff">' + escHtml(sncName) + '</span></div>'
+        : '';
       let title, color, body;
-      if (s.error && !s.enabled) {
+      if (!s.checked) {
+        // SNC name harvested, but full posture (QoP / enforcement) not probed yet.
+        title = '&#128274; SNC: name discovered';
+        color = '#58a6ff';
+        body = nameRow +
+          '<div style="color:#8b949e;font-size:11px;margin:4px 0">SNC partner identity harvested unauthenticated from the Message Server. Click <b>Re-probe SNC</b> for the full posture (protocol / QoP / enforcement).</div>';
+      } else if (s.error && !s.enabled) {
         title = '&#128274; SNC: probe failed';
         color = '#8b949e';
-        body = '<div class="detail-row"><span class="detail-key">Error</span><span class="detail-val">' + escHtml(s.error) + '</span></div>';
+        body = nameRow + '<div class="detail-row"><span class="detail-key">Error</span><span class="detail-val">' + escHtml(s.error) + '</span></div>';
       } else if (!s.enabled) {
         title = '&#128275; SNC: not enabled';
         color = '#d29922';
-        body = '<div style="color:#8b949e;font-size:11px;margin:4px 0">DIAG/Router traffic is unencrypted on the wire. SAP recommends snc/enabled=1 + snc/data_protection/min=3 for production.</div>';
+        body = nameRow + '<div style="color:#8b949e;font-size:11px;margin:4px 0">DIAG/Router traffic is unencrypted on the wire. SAP recommends snc/enabled=1 + snc/data_protection/min=3 for production.</div>';
       } else {
         title = '&#128274; SNC: enabled';
         color = '#3fb950';
@@ -11676,7 +11757,7 @@ function showDetails(sid, opts) {
           const c = val === 3 ? '#3fb950' : '#d29922';
           return '<div class="detail-row"><span class="detail-key">' + label + '</span><span class="detail-val" style="color:' + c + '">' + val + ' (' + lvl + ')</span></div>';
         };
-        body =
+        body = nameRow +
           '<div class="detail-row"><span class="detail-key">Protocol</span><span class="detail-val">' + escHtml(s.protocol || '') + '</span></div>' +
           (s.mech_label ? '<div class="detail-row"><span class="detail-key">Mechanism</span><span class="detail-val">' + escHtml(s.mech_label) + '</span></div>' : '') +
           (s.cryptolib ? '<div class="detail-row"><span class="detail-key">CryptoLib</span><span class="detail-val" style="font-family:monospace;font-size:11px">' + escHtml(s.cryptolib) + '</span></div>' : '') +
@@ -14427,6 +14508,11 @@ async function showConfigureSncModal() {
     }
     if (identEl) identEl.value = d.snc_identity || '';
     if (testBtn) testBtn.disabled = !d.ok;
+    // #137 PR2 — render the active looted-PSE SNC client identity, its
+    // effective path (native/cryptolib) and the likely-reach SID list,
+    // plus a wallet switcher populated from /api/snc/wallet.
+    renderActiveSncIdentity(d);
+    populateSncWalletSelect(d.active_snc_cred_id || '');
   } catch(e) {
     _sncStatus = null;
     if (secEl) secEl.textContent = '(error)';
@@ -14517,6 +14603,151 @@ async function saveSncConfig() {
     }
   } catch(e) {
     showToast('Failed to save SNC configuration: ' + e, 'error');
+  }
+}
+
+// #137 PR2 — Looted-PSE SNC client-identity wallet helpers.
+
+// Render the "Active SNC client identity" block from a /api/snc/status
+// payload (showConfigureSncModal already fetches it).
+function renderActiveSncIdentity(statusPayload) {
+  const idEl = document.getElementById('snc-active-identity');
+  const pathEl = document.getElementById('snc-active-path');
+  const reachRow = document.getElementById('snc-active-reach-row');
+  const reachEl = document.getElementById('snc-active-reach');
+  const active = statusPayload && statusPayload.active_snc_credential;
+  if (!active) {
+    if (idEl) idEl.innerHTML = '<span style="color:#8b949e">operator posture (no looted PSE active)</span>';
+    if (pathEl) pathEl.textContent = '—';
+    if (reachRow) reachRow.style.display = 'none';
+    return;
+  }
+  if (idEl) {
+    idEl.textContent = active.snc_identity || active.cred_id || '(unknown)';
+    idEl.style.color = '#3fb950';     // green: a looted identity is live
+  }
+  if (pathEl) {
+    pathEl.textContent = statusPayload.active_snc_path || '—';
+  }
+  const reach = (statusPayload.active_snc_reach || []);
+  if (reachRow && reachEl) {
+    if (reach.length > 0) {
+      reachEl.textContent = reach.join(', ') + ' (STRUSTSSO2 trust-graph hint, not an SNC ACL guarantee)';
+      reachRow.style.display = '';
+    } else {
+      reachRow.style.display = 'none';
+    }
+  }
+}
+
+// Populate the <select> of looted PSEs for the wallet switcher.
+async function populateSncWalletSelect(activeCredId) {
+  const sel = document.getElementById('snc-wallet-select');
+  if (!sel) return;
+  // Preserve the "operator posture" option at index 0.
+  sel.innerHTML = '<option value="">— operator posture (no looted PSE) —</option>';
+  try {
+    const d = await fetch('/api/snc/wallet').then(r => r.json());
+    const creds = (d && d.credentials) || [];
+    for (const c of creds) {
+      const opt = document.createElement('option');
+      opt.value = c.cred_id || '';
+      const pathHint = (c.key_is_rsa === true) ? 'RSA/native' :
+                       (c.key_is_rsa === false) ? 'EC/cryptolib' : 'unprobed';
+      opt.textContent = (c.cred_id || '?') + '  —  ' + (c.snc_identity || '') + '  (' + pathHint + ')';
+      sel.appendChild(opt);
+    }
+    sel.value = activeCredId || '';
+  } catch(e) {
+    // leave only the operator-posture option — wallet unreachable
+  }
+}
+
+// Activate whatever is picked in the switcher <select>.
+async function activateSelectedSncWalletEntry() {
+  const sel = document.getElementById('snc-wallet-select');
+  const credId = sel ? (sel.value || '') : '';
+  if (!credId) {
+    // user picked "operator posture" explicitly — same as clear
+    return clearActiveSncIdentity();
+  }
+  try {
+    const d = await fetch('/api/snc/wallet/activate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cred_id: credId}),
+    }).then(r => r.json());
+    if (d && d.ok) {
+      showToast('Active SNC client identity: ' + credId, 'success');
+      // Refresh the status block + switcher from the authoritative server view.
+      const s = await fetch('/api/snc/status').then(r => r.json());
+      _sncStatus = s;
+      renderActiveSncIdentity(s);
+      populateSncWalletSelect(s.active_snc_cred_id || '');
+    } else {
+      showToast('Activate failed: ' + (d && d.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    showToast('Activate failed: ' + e, 'error');
+  }
+}
+
+async function clearActiveSncIdentity() {
+  try {
+    const d = await fetch('/api/snc/wallet/clear', {method: 'POST'})
+      .then(r => r.json());
+    if (d && d.ok) {
+      showToast('Reverted to operator-posture SNC identity.', 'success');
+      const s = await fetch('/api/snc/status').then(r => r.json());
+      _sncStatus = s;
+      renderActiveSncIdentity(s);
+      populateSncWalletSelect('');
+    }
+  } catch(e) {
+    showToast('Clear failed: ' + e, 'error');
+  }
+}
+
+// ctx-menu: "Use this PSE as SNC identity" — pick the wallet entry whose
+// source_sid matches the clicked node and activate it.  The ctx-menu
+// gate (hasLootedPseInWallet) already guarantees ≥1 exists.  On a box
+// that yielded multiple PSEs (SNCCredential#N disambiguation) we
+// redirect to the Configure SNC modal so the operator picks explicitly
+// — the direct-POST path would silently gamble on iteration order.
+async function useLootedPseAsSncIdentity(sid) {
+  const wallet = (mapState && mapState.snc_credentials) || {};
+  const matches = Object.values(wallet).filter(c => c && c.source_sid === sid);
+  if (matches.length === 0) {
+    showToast('No looted PSE for ' + sid + ' in the wallet.', 'warning');
+    return;
+  }
+  if (matches.length > 1) {
+    // Ambiguous — open the modal so the operator can pick from the
+    // switcher and see which PSE is which.
+    showToast(sid + ' has ' + matches.length + ' looted PSEs — pick one in the Configure SNC modal.',
+              'info');
+    showConfigureSncModal();
+    return;
+  }
+  const entry = matches[0];
+  if (!confirm('Use the looted PSE from ' + sid + ' as the SNC client identity?\n\n' +
+               'SAPMAP will present identity:\n  ' + (entry.snc_identity || entry.cred_id) +
+               '\n\non every RFC-over-SNC logon until you revert.')) {
+    return;
+  }
+  try {
+    const d = await fetch('/api/snc/wallet/activate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cred_id: entry.cred_id || ''}),
+    }).then(r => r.json());
+    if (d && d.ok) {
+      showToast('Now using ' + sid + "'s PSE as SNC client identity.", 'success');
+    } else {
+      showToast('Activate failed: ' + (d && d.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    showToast('Activate failed: ' + e, 'error');
   }
 }
 
@@ -20241,6 +20472,9 @@ function showChainResults(chains) {
   // Also drop any stale dataset.sid so the poll's diff checks skip.
   panel.setAttribute('data-view', 'chains');
   panel.dataset.sid = 'chains';
+  // Hand the rendered chains to the kill-chain player (#196) so a card's
+  // Play control can replay chain N hop-by-hop without a server round-trip.
+  _lastChains = chains || [];
   const sevColors = { 5:'#e74c3c', 4:'#e67e22', 3:'#f1c40f', 2:'#3498db', 1:'#95a5a6' };
 
   if (chains.length === 0) {
@@ -20280,12 +20514,21 @@ function showChainResults(chains) {
             pathSids.map((s,i) => '<span style="color:' + (i === 0 ? '#f0883e' : i === pathSids.length-1 ? (c.end_is_production ? '#e74c3c' : '#58a6ff') : '#c9d1d9') + '">' + escHtml(s) + '</span>').join(arrow) +
           '</span>' +
         '</div>' +
+        '<div style="margin:5px 0;display:flex;gap:4px;align-items:center" onclick="event.stopPropagation()">' +
+          '<button class="kc-play-btn" title="Replay this attack path hop-by-hop on the map" onclick="event.stopPropagation(); playChain(' + idx + ')" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer">&#9654; Play</button>' +
+          '<button class="kc-pause-btn" title="Pause / resume replay" onclick="event.stopPropagation(); togglePlayPause()" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 7px;font-size:11px;cursor:pointer">&#10073;&#10073;</button>' +
+          '<button class="kc-replay-btn" title="Replay from the start" onclick="event.stopPropagation(); replayChain(' + idx + ')" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 7px;font-size:11px;cursor:pointer">&#8635;</button>' +
+          '<select class="kc-speed" title="Playback speed" onclick="event.stopPropagation()" onchange="event.stopPropagation(); setPlaySpeed(this.value)" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 4px;font-size:11px;cursor:pointer">' +
+            '<option value="0.5">0.5&times;</option><option value="1" selected>1&times;</option><option value="2">2&times;</option>' +
+          '</select>' +
+        '</div>' +
         (c.hops || []).map((h, hi) =>
           '<div style="font-size:11px;color:#8b949e;margin:2px 0;padding-left:' + (hi * 8 + 4) + 'px">' +
             '&#9654; ' + escHtml(h.source_sid) + ' &#8594; ' + escHtml(h.target_sid) +
             (h.destination_name ? ' via <span style="color:#58a6ff">' + escHtml(h.destination_name) + '</span>' : '') +
             (h.rfc_user ? ' (user: ' + escHtml(h.rfc_user) + ')' : '') +
             (h.has_sap_all ? ' <span style="color:#e74c3c;font-weight:bold">SAP_ALL</span>' : '') +
+            (h.method ? ' <span style="color:' + (sevColors[h.severity] || '#8b949e') + (h.untested ? ';opacity:0.65;font-style:italic' : ';font-weight:bold') + '">[' + escHtml(h.method) + ']</span>' : '') +
           '</div>'
         ).join('') +
         '<div style="font-size:11px;color:#8b949e;margin-top:4px">' +
@@ -20306,6 +20549,478 @@ function highlightChain(pathSids) {
   updateMap();
   // Auto-clear after 15 seconds
   setTimeout(() => { _highlightedChain = null; updateMap(); }, 15000);
+}
+
+// ---------------------------------------------------------------------------
+// Kill-chain player (#196) — replay a precomputed attack path hop-by-hop in
+// the #pulse-svg overlay.  Per hop: draw the edge on, pulse the landing node,
+// caption the technique.  Draws ONLY into #pulse-svg because updateMap()
+// rebuilds #map-svg via innerHTML on every state poll and would wipe any
+// animation parked in the main map.  Per-hop severity (5..2, from PR1) colours
+// each hop; untested hops are drawn faint + dashed.  100% client-side off the
+// chains already rendered in the panel — no new server route.
+// ---------------------------------------------------------------------------
+let _lastChains = [];     // chains most recently rendered by showChainResults
+let _playToken = 0;       // monotonic cancel token; bumping it kills in-flight play
+let _playTimers = [];     // pending setTimeout ids for the active play
+let _playState = null;    // {idx,i,hops,pathSids,paused} while playing, else null
+let _playSpeed = 1;       // 0.5 / 1 / 2
+
+const _PLAY_SEV_COLOR = { 5:'#ff4d4d', 4:'#f0883e', 3:'#d29922', 2:'#388bfd', 1:'#8b949e' };
+const _PLAY_SEV_NAME  = { 5:'CRITICAL', 4:'HIGH', 3:'MEDIUM', 2:'INFO', 1:'INFO' };
+
+function _playLayer() {
+  const pulse = document.getElementById('pulse-svg');
+  if (!pulse) return null;
+  let g = pulse.querySelector('g.kc-play-layer');
+  if (!g) {
+    g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', 'kc-play-layer');
+    pulse.appendChild(g);
+  }
+  return g;
+}
+
+function _clearPlayLayer() {
+  const g = _playLayer();
+  if (g) g.innerHTML = '';
+}
+
+function _cancelPlay() {
+  _playToken++;
+  _playTimers.forEach(function(t) { clearTimeout(t); });
+  _playTimers = [];
+}
+
+// BTP-aware centre resolver: mapState.nodes OR a 'BTP:<uuid8>' sentinel ->
+// mapState.btp_subaccounts.  Returns world-coord centre, or null when the
+// node isn't plotted yet (the hop is then skipped visually).
+function _playResolveCenter(sid) {
+  const BOX_W = 240, BOX_H = 174;
+  let n = (mapState.nodes || {})[sid];
+  if (!n && sid && sid.indexOf('BTP:') === 0) {
+    const suffix = sid.slice(4).toLowerCase();
+    const btp = mapState.btp_subaccounts || {};
+    for (const u in btp) {
+      if (u.toLowerCase().indexOf(suffix) === 0) { n = btp[u]; break; }
+    }
+  }
+  if (!n || n._x == null) return null;
+  return { x: n._x, y: n._y, cx: n._x + BOX_W / 2, cy: n._y + BOX_H / 2 };
+}
+
+function playChain(idx) {
+  playChainData(_lastChains[idx]);
+}
+
+// Replay a specific chain object.  Used by the card Play control (via
+// playChain(idx)) AND by the 'play_chain' UI command the scripting engine
+// pushes, which hands over the whole chain dict (path_sids + per-hop
+// methods/severities) so playback needs no _lastChains index.
+function playChainData(chain) {
+  if (!chain) return;
+  const hops = chain.hops || [];
+  if (hops.length === 0) { alert('This chain has no hops to replay.'); return; }
+  _cancelPlay();
+  _clearPlayLayer();
+  _playState = { i: 0, drawn: -1, hops: hops,
+                 pathSids: chain.path_sids || [], paused: false };
+  _syncPlayButtons();
+  _playStep(_playToken);
+}
+
+function _playStep(token) {
+  if (token !== _playToken || !_playState || _playState.paused) return;
+  const st = _playState;
+  if (st.i >= st.hops.length) {               // finished
+    try {
+      if (typeof showToast === 'function')
+        showToast('Kill-chain replay complete — ' + st.hops.length + ' hops.');
+    } catch (_) {}
+    _playState = null;
+    _syncPlayButtons();
+    _playTimers.push(setTimeout(function() {
+      if (token === _playToken) _clearPlayLayer();
+    }, 6000));
+    return;
+  }
+  const hop = st.hops[st.i];
+  const sev = hop.severity || 2;
+  const color = _PLAY_SEV_COLOR[sev] || _PLAY_SEV_COLOR[2];
+  const a = _playResolveCenter(hop.source_sid);
+  const b = _playResolveCenter(hop.target_sid);
+  const drawMs = Math.round(800 / _playSpeed);
+  const dwellMs = Math.round(400 / _playSpeed);
+
+  // Draw each hop's edge + caption exactly once.  Pausing clears the
+  // pending timers without advancing st.i, so a resume re-enters _playStep
+  // on the same hop; the st.drawn guard stops that from stacking duplicate
+  // glow/line/caption elements (and re-triggering the draw-on) in the layer.
+  if (st.drawn !== st.i && a && b) {
+    const g = _playLayer();
+    const NS = 'http://www.w3.org/2000/svg';
+    // glow underlay
+    const glow = document.createElementNS(NS, 'line');
+    glow.setAttribute('x1', a.cx); glow.setAttribute('y1', a.cy);
+    glow.setAttribute('x2', b.cx); glow.setAttribute('y2', b.cy);
+    glow.setAttribute('stroke', color); glow.setAttribute('stroke-width', 12);
+    glow.setAttribute('opacity', 0.18); glow.setAttribute('stroke-linecap', 'round');
+    if (g) g.appendChild(glow);
+    // main line, drawn on
+    const line = document.createElementNS(NS, 'line');
+    line.setAttribute('x1', a.cx); line.setAttribute('y1', a.cy);
+    line.setAttribute('x2', b.cx); line.setAttribute('y2', b.cy);
+    line.setAttribute('stroke', color); line.setAttribute('stroke-width', 4);
+    line.setAttribute('stroke-linecap', 'round');
+    if (g) g.appendChild(line);
+    if (hop.untested) {
+      // Dashed + opacity fade-in (dash-offset draw-on would fight the dashes).
+      line.setAttribute('stroke-dasharray', '9,6');
+      line.style.opacity = '0';
+      line.style.transition = 'opacity ' + drawMs + 'ms ease-out';
+      line.getBoundingClientRect();        // force reflow
+      line.style.opacity = '0.9';
+    } else {
+      const len = line.getTotalLength ? line.getTotalLength() : 600;
+      line.style.strokeDasharray = len;
+      line.style.strokeDashoffset = len;
+      line.style.transition = 'stroke-dashoffset ' + drawMs + 'ms ease-out';
+      line.getBoundingClientRect();        // force reflow
+      line.style.strokeDashoffset = '0';
+    }
+    _playCaption(hop, b, color, st.i + 1, st.hops.length);
+    st.drawn = st.i;
+  }
+
+  // Pulse the landing node once the edge finishes drawing.
+  const t1 = setTimeout(function() {
+    if (token !== _playToken || !_playState || _playState.paused) return;
+    try { _pulseNode(hop.target_sid, _PLAY_SEV_NAME[sev] || 'INFO'); } catch (_) {}
+  }, drawMs);
+  _playTimers.push(t1);
+
+  // Advance to the next hop after the draw + dwell.
+  const t2 = setTimeout(function() {
+    if (token !== _playToken || !_playState || _playState.paused) return;
+    _playState.i++;
+    _playStep(token);
+  }, drawMs + dwellMs);
+  _playTimers.push(t2);
+}
+
+function _playCaption(hop, center, color, step, total) {
+  const g = _playLayer();
+  if (!g) return;
+  const NS = 'http://www.w3.org/2000/svg';
+  const txt = document.createElementNS(NS, 'text');
+  txt.setAttribute('x', center.cx);
+  txt.setAttribute('y', center.y - 14);
+  txt.setAttribute('text-anchor', 'middle');
+  txt.setAttribute('font-size', '15');
+  txt.setAttribute('font-weight', 'bold');
+  txt.setAttribute('font-family', 'monospace');
+  txt.setAttribute('fill', color);
+  txt.setAttribute('stroke', '#0d1117');       // dark halo for legibility
+  txt.setAttribute('stroke-width', '0.6');
+  txt.setAttribute('paint-order', 'stroke');
+  if (hop.untested) {
+    txt.setAttribute('opacity', '0.65');
+    txt.setAttribute('font-style', 'italic');
+  }
+  txt.textContent = '[' + step + '/' + total + '] ' + (hop.method || '');
+  g.appendChild(txt);
+}
+
+function togglePlayPause() {
+  if (!_playState) return;
+  if (_playState.paused) {
+    _playState.paused = false;
+    _syncPlayButtons();
+    _playStep(_playToken);        // resume from the current hop
+  } else {
+    _playState.paused = true;
+    _playTimers.forEach(function(t) { clearTimeout(t); });
+    _playTimers = [];
+    _syncPlayButtons();
+  }
+}
+
+function replayChain(idx) { playChain(idx); }
+
+function stopPlay() {
+  _cancelPlay();
+  _clearPlayLayer();
+  _playState = null;
+  _syncPlayButtons();
+}
+
+function setPlaySpeed(mult) {
+  const v = parseFloat(mult);
+  if (v > 0) _playSpeed = v;
+}
+
+function _syncPlayButtons() {
+  const playing = !!(_playState && !_playState.paused);
+  document.querySelectorAll('.kc-pause-btn').forEach(function(btn) {
+    btn.innerHTML = playing ? '&#10073;&#10073;' : '&#9654;';
+    btn.title = playing ? 'Pause replay' : 'Resume replay';
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Blast-radius flood-fill (#197) — flood a node's reachable set ring by ring
+// in the #pulse-svg overlay, colour-graded by hop distance, and leave a
+// persistent ring-tinted node outline (re-applied after every state poll) +
+// a legend / counter.  Two triggers: the node context-menu entries
+// (Blast Radius / Exposure Cone), and Blast-Radius Mode (left-click = forward
+// flood, right-click = inverse cone).  Purely a VIEW over the adjacency the
+// server already computes (/api/actions/blast_radius) — no discovery, no
+// exploitation.  The ring animation lives in the #pulse-svg overlay (updateMap
+// rebuilds #map-svg via innerHTML on every poll and would wipe it); the
+// persistent outlines hang off the node-box groups and are re-attached by
+// _reapplyBlast() after each poll, exactly like the ATT&CK highlight.
+// ---------------------------------------------------------------------------
+let _blastMode = false;      // mode toggle: node clicks flood instead of drag
+let _blastToken = 0;         // monotonic cancel token for the ring animation
+let _blastTimers = [];       // pending setTimeout ids for the active flood
+let _blastState = null;      // the last flood result dict while it is shown
+let _blastReqSeq = 0;        // request generation: a later flood or a clear
+                             // bumps it so an in-flight fetch that has been
+                             // superseded or dismissed never paints on resume
+
+// Distance ramp: near (ring 1, hot) -> far (cool); beyond the ramp -> grey.
+const _BLAST_RING_COLORS =
+  ['#ff3b30', '#ff9500', '#ffd60a', '#34c759', '#40c8e0', '#5e5ce6'];
+
+function _blastRingColor(hop) {
+  if (hop >= 1 && hop <= _BLAST_RING_COLORS.length)
+    return _BLAST_RING_COLORS[hop - 1];
+  return '#8e8e93';
+}
+
+function _blastLayer() {
+  const pulse = document.getElementById('pulse-svg');
+  if (!pulse) return null;
+  let g = pulse.querySelector('g.bl-flood-layer');
+  if (!g) {
+    g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', 'bl-flood-layer');
+    pulse.appendChild(g);
+  }
+  return g;
+}
+
+function _clearBlastLayer() {
+  const g = _blastLayer();
+  if (g) g.innerHTML = '';
+}
+
+function _cancelBlastAnim() {
+  _blastToken++;
+  _blastTimers.forEach(function(t) { clearTimeout(t); });
+  _blastTimers = [];
+}
+
+function toggleBlastMode() {
+  _blastMode = !_blastMode;
+  const item = document.getElementById('blast-mode-item');
+  if (item)
+    item.innerHTML = '&#128165; Blast-Radius Mode: ' + (_blastMode ? 'On' : 'Off');
+  const mc = document.getElementById('map-container');
+  if (mc) mc.style.cursor = _blastMode ? 'crosshair' : '';
+  try {
+    if (typeof showToast === 'function')
+      showToast(_blastMode
+        ? 'Blast-Radius Mode ON — LEFT-click a node to flood what it can reach, '
+          + 'RIGHT-click for who can reach it. Node dragging is suspended.'
+        : 'Blast-Radius Mode off.', 'info');
+  } catch (_) {}
+}
+
+async function floodBlastRadius(sid, mode) {
+  if (!sid) return;
+  mode = (mode === 'inverse') ? 'inverse' : 'forward';
+  // Request generation: capture now, re-check after the await.  A later
+  // flood or a clearBlast() bumps _blastReqSeq, so a response that arrives
+  // after its flood was superseded or dismissed (out-of-order double-click,
+  // or clear-while-in-flight) is dropped instead of painting a stale view.
+  const myReq = ++_blastReqSeq;
+  let data;
+  try {
+    const r = await fetch('/api/actions/blast_radius', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sid: sid, mode: mode, max_depth: 6 }),
+    });
+    data = await r.json();
+  } catch (e) {
+    try { if (typeof showToast === 'function') showToast('Blast radius failed: ' + e, 'error'); } catch (_) {}
+    return;
+  }
+  if (myReq !== _blastReqSeq) return;   // superseded / cleared while in flight
+  if (!data || data.status !== 'ok') {
+    try { if (typeof showToast === 'function') showToast('Blast radius: ' + ((data && data.error) || 'no result'), 'error'); } catch (_) {}
+    return;
+  }
+  if (!data.reachable) {
+    clearBlast();
+    try {
+      if (typeof showToast === 'function')
+        showToast((mode === 'inverse' ? 'Nothing can reach ' : 'Nothing reachable from ')
+                  + sid + '.', 'info');
+    } catch (_) {}
+    return;
+  }
+  _cancelBlastAnim();
+  _clearBlastLayer();
+  _blastState = data;               // {anchor, mode, rings, nodes, reachable, max_hop}
+  _renderBlastLegend(data);
+  _clearBlastOutlines();
+  _reapplyBlast();                  // persistent ring outlines, immediately
+  _animateBlast(data, ++_blastToken);
+}
+
+function _animateBlast(data, token) {
+  const rings = data.rings || [];
+  const perRing = 450;              // ms between successive hop-rings
+  let lastAt = 0;
+  rings.forEach(function(ring, idx) {
+    const at = idx * perRing;
+    lastAt = at;
+    const t = setTimeout(function() {
+      if (token !== _blastToken) return;
+      const color = _blastRingColor(ring.hop);
+      (ring.sids || []).forEach(function(tgt) {
+        const meta = (data.nodes || {})[tgt] || {};
+        _blastDrawEdge(meta.via, tgt, color);
+        try { _pulseNode(tgt, color); } catch (_) {}
+      });
+    }, at);
+    _blastTimers.push(t);
+  });
+  // Fade the transient edge layer once the propagation has played out; the
+  // persistent ring outlines + legend remain until the flood is cleared.
+  const tc = setTimeout(function() {
+    if (token === _blastToken) _clearBlastLayer();
+  }, lastAt + 2600);
+  _blastTimers.push(tc);
+}
+
+function _blastDrawEdge(srcSid, tgtSid, color) {
+  const g = _blastLayer();
+  if (!g) return;
+  const a = _getNodeCenter(srcSid), b = _getNodeCenter(tgtSid);
+  if (!a || !b) return;             // a node not plotted (e.g. BTP sentinel)
+  const NS = 'http://www.w3.org/2000/svg';
+  const glow = document.createElementNS(NS, 'line');
+  glow.setAttribute('x1', a.cx); glow.setAttribute('y1', a.cy);
+  glow.setAttribute('x2', b.cx); glow.setAttribute('y2', b.cy);
+  glow.setAttribute('stroke', color); glow.setAttribute('stroke-width', 10);
+  glow.setAttribute('opacity', 0.16); glow.setAttribute('stroke-linecap', 'round');
+  g.appendChild(glow);
+  const line = document.createElementNS(NS, 'line');
+  line.setAttribute('x1', a.cx); line.setAttribute('y1', a.cy);
+  line.setAttribute('x2', b.cx); line.setAttribute('y2', b.cy);
+  line.setAttribute('stroke', color); line.setAttribute('stroke-width', 3);
+  line.setAttribute('stroke-linecap', 'round');
+  g.appendChild(line);
+  const len = line.getTotalLength ? line.getTotalLength() : 400;
+  line.style.strokeDasharray = len;
+  line.style.strokeDashoffset = len;
+  line.style.transition = 'stroke-dashoffset 360ms ease-out';
+  line.getBoundingClientRect();     // force reflow so the draw-on animates
+  line.style.strokeDashoffset = '0';
+}
+
+// Re-attach the persistent per-node ring outline after a state poll wiped it
+// (updateMap rebuilds #map-svg).  Called from updateMap, mirroring
+// _reapplyAttackHighlights.
+function _reapplyBlast() {
+  if (!_blastState || !_blastState.nodes) return;
+  const nodes = _blastState.nodes;
+  document.querySelectorAll('g.node-box[data-sid]').forEach(function(el) {
+    const sid = el.getAttribute('data-sid');
+    if (sid === _blastState.anchor) {
+      _attachBlastOutline(el, '#ffffff', true);   // the anchor, dashed white
+      return;
+    }
+    const meta = nodes[sid];
+    if (meta) _attachBlastOutline(el, _blastRingColor(meta.hop), false);
+  });
+}
+
+function _attachBlastOutline(el, color, isAnchor) {
+  // Drop any prior blast outline on this node so repeated applies (immediate
+  // + per-poll) never stack duplicate rects.
+  el.querySelectorAll('rect.blast-hl-overlay').forEach(function(e) {
+    try { e.remove(); } catch (_) {}
+  });
+  const rectEl = el.querySelector('rect');
+  if (!rectEl) return;
+  const x = parseFloat(rectEl.getAttribute('x'));
+  const y = parseFloat(rectEl.getAttribute('y'));
+  const w = parseFloat(rectEl.getAttribute('width'));
+  const h = parseFloat(rectEl.getAttribute('height'));
+  if (isNaN(x) || isNaN(y) || isNaN(w) || isNaN(h)) return;
+  const NS = 'http://www.w3.org/2000/svg';
+  const ring = document.createElementNS(NS, 'rect');
+  ring.setAttribute('class', 'blast-hl-overlay');
+  ring.setAttribute('x', x - 3); ring.setAttribute('y', y - 3);
+  ring.setAttribute('width', w + 6); ring.setAttribute('height', h + 6);
+  ring.setAttribute('rx', '9'); ring.setAttribute('fill', 'none');
+  ring.setAttribute('stroke', color);
+  ring.setAttribute('stroke-width', isAnchor ? 6 : 4);
+  ring.setAttribute('pointer-events', 'none');
+  if (isAnchor) ring.setAttribute('stroke-dasharray', '10,5');
+  ring.innerHTML =
+    '<animate attributeName="stroke-opacity" values="1;0.45;1" '
+    + 'dur="1.6s" repeatCount="indefinite" />';
+  el.appendChild(ring);
+}
+
+function _clearBlastOutlines() {
+  document.querySelectorAll('rect.blast-hl-overlay').forEach(function(e) {
+    try { e.remove(); } catch (_) {}
+  });
+}
+
+function _renderBlastLegend(data) {
+  const el = document.getElementById('blast-legend');
+  if (!el) return;
+  const anchor = escHtml(data.anchor || '');
+  const n = data.reachable || 0, k = data.max_hop || 0;
+  const title = (data.mode === 'inverse') ? 'Exposure cone' : 'Blast radius';
+  const verb = (data.mode === 'inverse')
+    ? (n + ' system' + (n === 1 ? '' : 's') + ' can reach ' + anchor)
+    : (n + ' system' + (n === 1 ? '' : 's') + ' reachable from ' + anchor);
+  let swatches = '';
+  (data.rings || []).forEach(function(ring) {
+    const c = _blastRingColor(ring.hop);
+    swatches +=
+      '<span style="display:inline-flex;align-items:center;margin:0 8px 2px 0;white-space:nowrap">'
+      + '<span style="width:11px;height:11px;border-radius:3px;background:' + c
+      + ';display:inline-block;margin-right:3px"></span>hop ' + ring.hop
+      + ' (' + (ring.sids || []).length + ')</span>';
+  });
+  el.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">'
+    + '<strong>' + title + '</strong>'
+    + '<span onclick="clearBlast()" title="Clear" '
+    + 'style="cursor:pointer;color:#8b949e;font-weight:bold;padding:0 2px">&#10005;</span>'
+    + '</div>'
+    + '<div style="margin-bottom:6px">' + escHtml(verb)
+    + ' &middot; &le; ' + k + ' hop' + (k === 1 ? '' : 's') + '</div>'
+    + '<div style="display:flex;flex-wrap:wrap">' + swatches + '</div>';
+  el.style.display = '';
+}
+
+function clearBlast() {
+  _cancelBlastAnim();
+  _blastReqSeq++;                  // invalidate any in-flight flood request
+  _clearBlastLayer();
+  _clearBlastOutlines();
+  _blastState = null;
+  const el = document.getElementById('blast-legend');
+  if (el) { el.style.display = 'none'; el.innerHTML = ''; }
 }
 
 async function testAllRFCs() {
@@ -20554,6 +21269,8 @@ function _sccHostForNode(n) {
 }
 function resetLayout() {
   flashActivity('Rearranging: Reset');
+  _clearRingsMode();
+  _loReanchorSatellites();
   viewBoxUserControlled = false;
   viewBox.x = 0; viewBox.y = 0; viewBox._nodeCount = 0;
   Object.values(mapState.nodes || {}).forEach(n => { n._x = null; n._y = null; });
@@ -20592,6 +21309,20 @@ function _loSortedNodeKeys() {
   return Object.keys(nodes).sort();
 }
 
+// Re-anchor the DBCON cylinder / TMS truck accessories to their source.
+// These live in their source SAP box's zone but are cached by ABSOLUTE
+// coords in dbconPositions / tmsPositions, which the layout functions
+// never move — so after a re-layout the source box jumps elsewhere and
+// the accessories stay stranded at their old spot (issue #191).  An
+// explicit Layout command is a GLOBAL re-arrange, so we drop ALL cached
+// accessory positions (pinned manual drags included); the next render
+// re-walks each one fresh, below/right of its source's new position.
+// Called by every layout entry point before its fitMap()/updateMap().
+function _loReanchorSatellites() {
+  dbconPositions = {};
+  tmsPositions = {};
+}
+
 // Place BTP subaccount nodes in a horizontal strip starting at
 // (xStart, yStart) and return the vertical space they consumed
 // (0 when there are none).  Every alternative layout calls this
@@ -20628,6 +21359,8 @@ function layoutCircle() {
   ].filter(x => x.obj);
   if (allItems.length === 0) return;
   flashActivity('Rearranging: Circle');
+  _clearRingsMode();
+  _loReanchorSatellites();
   // Radius scales with total node count so boxes never overlap on the ring.
   const total = allItems.length;
   const circ = total * (_LO_BOX_W + _LO_MARGIN);
@@ -20648,6 +21381,8 @@ function layoutStar() {
   const sccHosts = Object.keys(mapState.scc_nodes || {}).sort();
   if (sids.length === 0 && sccHosts.length === 0) return;
   flashActivity('Rearranging: Star');
+  _clearRingsMode();
+  _loReanchorSatellites();
   const nodes = mapState.nodes || {};
   const conns = mapState.connections || [];
   const deg = {};
@@ -20690,6 +21425,8 @@ function layoutHierarchy() {
   const sids = _loSortedNodeKeys();
   if (sids.length === 0) return;
   flashActivity('Rearranging: Hierarchy');
+  _clearRingsMode();
+  _loReanchorSatellites();
   const nodes = mapState.nodes;
   const conns = mapState.connections || [];
   // Build incoming edge map (target -> [source])
@@ -20856,6 +21593,8 @@ function layoutByStack() {
   const sccHosts = Object.keys(mapState.scc_nodes || {}).sort();
   if (sids.length === 0 && sccHosts.length === 0) return;
   flashActivity('Rearranging: Group by Stack');
+  _clearRingsMode();
+  _loReanchorSatellites();
   const nodes = mapState.nodes;
 
   function bucketOf(n) {
@@ -20897,6 +21636,184 @@ function layoutByStack() {
   updateMap();
 }
 
+// ---------------------------------------------------------------------------
+// Defense-in-depth rings layout (#198) — centre the crown jewel and arrange
+// every system in concentric rings by exploit distance (shortest hop count
+// from the nearest entry).  Entry points on the outer ring; each ring inward
+// = +1 hop; unreachable-from-entry nodes in a separated outer band.  It is a
+// TOGGLE: entering snapshots the current positions; toggling off restores
+// them.  A view over the exploit distances the server computes
+// (/api/actions/exploit_distances) — no new discovery.
+// ---------------------------------------------------------------------------
+let _ringsActive = false;
+let _ringsSavedPositions = null;   // {sap,scc,btp} position snapshot, for restore
+let _ringsReqSeq = 0;              // request generation: a newer rings run or a
+                                   // switch to another layout bumps it, so a
+                                   // stale exploit_distances response that
+                                   // resolves late never paints or re-snapshots
+
+function _snapshotPositions() {
+  const snap = { sap: {}, scc: {}, btp: {} };
+  const put = (obj, map, id) => { if (obj) map[id] = { x: obj._x, y: obj._y }; };
+  Object.keys(mapState.nodes || {}).forEach(s => put(mapState.nodes[s], snap.sap, s));
+  Object.keys(mapState.scc_nodes || {}).forEach(h => put(mapState.scc_nodes[h], snap.scc, h));
+  Object.keys(mapState.btp_subaccounts || {}).forEach(u => put(mapState.btp_subaccounts[u], snap.btp, u));
+  return snap;
+}
+
+function _restorePositions(snap) {
+  if (!snap) return;
+  const take = (obj, map, id) => { if (obj && map[id]) { obj._x = map[id].x; obj._y = map[id].y; } };
+  Object.keys(mapState.nodes || {}).forEach(s => take(mapState.nodes[s], snap.sap, s));
+  Object.keys(mapState.scc_nodes || {}).forEach(h => take(mapState.scc_nodes[h], snap.scc, h));
+  Object.keys(mapState.btp_subaccounts || {}).forEach(u => take(mapState.btp_subaccounts[u], snap.btp, u));
+}
+
+function _syncRingsButton() {
+  const item = document.getElementById('defense-rings-item');
+  if (item) item.innerHTML = '🎯 Layout: Defense-in-Depth Rings' + (_ringsActive ? ' ✓' : '');
+}
+
+// Another layout replaced the rings view — forget the rings state so the menu
+// label and the restore snapshot reflect reality.  Called by the other layout
+// entry points (they are an explicit choice of a new layout, not a toggle-off,
+// so they do NOT restore the snapshot).
+function _clearRingsMode() {
+  if (!_ringsActive && !_ringsSavedPositions) return;
+  _ringsReqSeq++;                 // invalidate any in-flight rings fetch
+  _ringsActive = false;
+  _ringsSavedPositions = null;
+  _syncRingsButton();
+}
+
+async function toggleDefenseRings() {
+  if (_ringsActive) {
+    _ringsReqSeq++;               // invalidate any in-flight rings fetch
+    _restorePositions(_ringsSavedPositions);
+    _ringsSavedPositions = null;
+    _ringsActive = false;
+    _syncRingsButton();
+    _loReanchorSatellites();
+    fitMap(); updateMap();
+    try { if (typeof showToast === 'function') showToast('Restored your previous layout.', 'info'); } catch (_) {}
+    return;
+  }
+  await layoutDefenseRings();
+}
+
+async function layoutDefenseRings() {
+  // Request generation: a newer rings run, a switch to another layout, or a
+  // toggle-off bumps _ringsReqSeq, so a response that resolves after its run
+  // was superseded is dropped instead of painting / re-snapshotting.
+  const myReq = ++_ringsReqSeq;
+  // Snapshot the pre-rings layout BEFORE the fetch, and only when entering
+  // from a non-rings state — so re-entry while already active (a second
+  // `layout rings`, a double-click) never overwrites the saved original with
+  // ring coordinates.
+  if (!_ringsActive) _ringsSavedPositions = _snapshotPositions();
+  let data;
+  try {
+    const r = await fetch('/api/actions/exploit_distances', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_depth: 6 }),
+    });
+    data = await r.json();
+  } catch (e) {
+    try { if (typeof showToast === 'function') showToast('Rings layout failed: ' + e, 'error'); } catch (_) {}
+    return;
+  }
+  if (myReq !== _ringsReqSeq) return;   // superseded / cleared while in flight
+  if (!data || data.status !== 'ok') {
+    try { if (typeof showToast === 'function') showToast('Rings layout: ' + ((data && data.error) || 'no result'), 'error'); } catch (_) {}
+    return;
+  }
+  const distances = data.distances || {};
+  const entries = data.entries || [];
+  if (!entries.length) {
+    try {
+      if (typeof showToast === 'function')
+        showToast('No entry points yet — nothing to measure exploit distance from. '
+                  + 'Scan / exploit a system first.', 'info');
+    } catch (_) {}
+    return;
+  }
+  flashActivity('Rearranging: Defense-in-Depth Rings');
+  _loReanchorSatellites();
+
+  const maxDist = data.max_distance || 0;
+  const centerSid = data.center_sid;
+  const RING = _LO_BOX_H + _LO_MARGIN * 1.2;    // base radial spacing
+
+  // Resolve a distance-map SID to its plottable object (SAP node, or a
+  // "BTP:<uuid8>" sentinel -> its subaccount).  SCC nodes aren't in the
+  // exploit graph; they ride along in the unreachable band.
+  const resolve = (sid) => {
+    if ((mapState.nodes || {})[sid]) return mapState.nodes[sid];
+    if (sid.indexOf('BTP:') === 0) {
+      const suf = sid.slice(4).toLowerCase();
+      const btp = mapState.btp_subaccounts || {};
+      for (const u in btp) if (u.toLowerCase().indexOf(suf) === 0) return btp[u];
+    }
+    return null;
+  };
+
+  // Group by RING INDEX = (maxDist - distance + 1): entries (distance 0) land
+  // on the outermost reachable ring, the deepest systems just outside the
+  // centre.  The crown jewel sits at the exact centre.  Unreachable nodes
+  // (incl. SCC) go in an extra outer band beyond the entries.
+  const byRing = {};
+  const centerObj = centerSid ? resolve(centerSid) : null;
+  Object.keys(distances).forEach(sid => {
+    if (sid === centerSid) return;              // centre
+    const obj = resolve(sid);
+    if (!obj) return;
+    const ri = (maxDist - distances[sid]) + 1;
+    (byRing[ri] = byRing[ri] || []).push(obj);
+  });
+  const OUTER_BAND = maxDist + 2;
+  const unreachObjs = [];
+  (data.unreachable || []).forEach(sid => { const o = resolve(sid); if (o) unreachObjs.push(o); });
+  Object.keys(mapState.scc_nodes || {}).forEach(h => unreachObjs.push(mapState.scc_nodes[h]));
+  if (unreachObjs.length) byRing[OUTER_BAND] = (byRing[OUTER_BAND] || []).concat(unreachObjs);
+
+  // Canvas centre big enough to hold the outermost band without clipping.
+  const outerR = OUTER_BAND * RING;
+  const cx = outerR + _LO_BOX_W;
+  const cy = outerR + _LO_BOX_H;
+  if (centerObj) _loCenter(centerObj, cx, cy);
+
+  Object.keys(byRing).map(Number).sort((a, b) => a - b).forEach(ri => {
+    const objs = byRing[ri];
+    const n = objs.length;
+    // Radius: at least ri*RING, grown so n boxes fit the circumference.
+    const minR = (n * (_LO_BOX_W + _LO_MARGIN)) / (2 * Math.PI);
+    const radius = Math.max(ri * RING, minR);
+    // Rotate each ring by the golden angle so sparse rings (1-2 nodes) fan
+    // out instead of collapsing onto a single vertical spoke — on a near-
+    // linear landscape that is the difference between concentric rings and
+    // an unreadable column.
+    const offset = ri * 2.399963;
+    objs.forEach((obj, i) => {
+      const angle = offset + (2 * Math.PI * i) / n;
+      _loCenter(obj, cx + radius * Math.cos(angle), cy + radius * Math.sin(angle));
+    });
+  });
+
+  _ringsActive = true;
+  _syncRingsButton();
+  fitMap(); updateMap();
+  try {
+    if (typeof showToast === 'function') {
+      const jewel = centerSid ? (centerSid + ' centred, ') : '';
+      const nUnreach = (data.unreachable || []).length;
+      showToast('Defense-in-depth rings: ' + jewel + 'production is ' + maxDist
+                + ' hop' + (maxDist === 1 ? '' : 's') + ' from the attack edge'
+                + (nUnreach ? ' (' + nUnreach + ' unreachable from any entry).' : '.'),
+                'info');
+    }
+  } catch (_) {}
+}
+
 // Arrange every node in a grid whose bounding-box aspect ratio matches
 // the live SVG viewport, so that under SVG's "meet" scaling the fitted
 // boxes render as large as possible (minimal letterbox waste) while
@@ -20914,6 +21831,7 @@ function layoutFitCanvas() {
   const N = items.length;
   if (N === 0) return;
   flashActivity('Rearranging: Fit Canvas');
+  _loReanchorSatellites();
   const svg = document.getElementById('map-svg');
   const vpW = (svg && svg.clientWidth)  || 1200;
   const vpH = (svg && svg.clientHeight) || 800;
@@ -20968,6 +21886,7 @@ function layoutFixedColumns() {
   cols = Math.min(cols, N);
   _fixedColsPref = cols;
   flashActivity('Rearranging: ' + cols + ' per row');
+  _loReanchorSatellites();
   const cellW = _LO_BOX_W + _LO_MARGIN;
   const cellH = _LO_BOX_H + _LO_MARGIN;
   items.forEach((obj, i) => {
@@ -21141,6 +22060,9 @@ function _getDragTarget(sid) {
 }
 function startDrag(e, sid) {
   if (e.button === 2) return; // right-click = context menu
+  // Blast-Radius Mode (#197): a left-click floods what this node can reach
+  // instead of starting a drag.
+  if (_blastMode) { e.stopPropagation(); floodBlastRadius(sid, 'forward'); return; }
   e.stopPropagation();
   dragNode = sid;
   dragMoved = false;
@@ -21487,7 +22409,12 @@ function _pulseNode(sid, severity) {
   if (!pulse) return;
   const pos = _getNodeCenter(sid);
   if (!pos) return;
-  const color = _PULSE_COLORS[severity] || _PULSE_COLORS.INFO;
+  // `severity` is normally a key into _PULSE_COLORS, but callers (the
+  // blast-radius flood) may pass an explicit "#rrggbb" to pulse in a
+  // distance-ramp colour instead.
+  const color = _PULSE_COLORS[severity]
+    || (typeof severity === 'string' && severity.charAt(0) === '#'
+          ? severity : _PULSE_COLORS.INFO);
   const svgNS = 'http://www.w3.org/2000/svg';
   // Border rect: starts flush with the node, expands outward while fading.
   const pad = 4;
@@ -21670,6 +22597,17 @@ document.addEventListener('click', e => {
   hideDBCONCtxMenu();
   if (!e.target.closest('.info-panel') && !e.target.closest('.edge-line'))
     document.getElementById('info-panel').classList.remove('visible');
+  // Blast-radius flood (#197) clears on a click-away: anywhere that is not a
+  // node, the legend, ANY context menu (all six share the .ctx-menu class —
+  // #ctx-menu / #map-ctx-menu / #scc-ctx-menu / #btp-ctx-menu / #tms-ctx-menu
+  // / #dbcon-ctx-menu), or the top-nav (which is how it is triggered).  A node
+  // click in Blast-Radius Mode re-floods instead.
+  if (_blastState && !e.target.closest('.node-box')
+      && !e.target.closest('#blast-legend')
+      && !e.target.closest('.ctx-menu')
+      && !e.target.closest('.menu-item')) {
+    clearBlast();
+  }
 });
 
 document.addEventListener('contextmenu', e => {
