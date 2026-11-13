@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""
+SAPMAP Command Processor — an interactive, plugin-style REPL over a .sapmap file.
+
+The processor loads a ``.sapmap`` session file (plain JSON) as a mutable Python
+``dict`` and loops over recurring prompts ("wiederkehrende Abfragen").  Each line
+the operator types is dispatched to a :class:`Command`.
+
+Design goals (see issue spec):
+
+1. Input is a ``.sapmap`` file — loaded verbatim as a ``dict`` (we deliberately
+   do NOT round-trip through :class:`SAPMAPState`, so unknown/forward-compatible
+   keys survive edit-and-save).
+2. The prompt *varies* with context — the currently selected node is appended as
+   ``>SID``, and the outcome of the last command (success/failure) is reflected.
+3. Commands are plugins with a **name**, **aliases**, **args** and **conditions**.
+   A *condition* gates a command: it may only run when the condition holds (e.g.
+   ``rfc-connect`` requires a selected ABAP node that has credentials).  A command
+   may change the prompt on success or on failure.
+4. The state is the ``.sapmap`` content as a ``dict``; it can be mutated and saved.
+
+The three landscape commands required by the spec are implemented as plugins:
+
+  * ``list_nodes`` / ``ln``     — print ``.nodes[].sid`` (screen-limited; ``a`` = all)
+  * ``use_node_by_sid`` / ``un`` — select a node, appending ``>SID`` to the prompt
+  * ``search_node`` / ``sn``    — substring search over sid/description/sapology
+
+Built-in housekeeping commands (``help``, ``save``, ``quit``) round out the loop.
+
+Run standalone::
+
+    python3 -m modules.ops.sapmap_cmdproc states/my_session.sapmap
+    # or, thanks to modules/__init__.py path registration:
+    python3 modules/ops/sapmap_cmdproc.py states/my_session.sapmap
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# State helpers — operate on the raw .sapmap dict
+# ---------------------------------------------------------------------------
+#
+# ``nodes`` in a .sapmap file is a dict keyed by SID (``{"GFE": {...}}``), but
+# older/hand-edited files may carry a list.  ``iter_nodes`` normalises both into
+# a list of ``(key, node)`` pairs so the rest of the code never has to care.
+
+def iter_nodes(state: Dict[str, Any]) -> List[Tuple[Any, Dict[str, Any]]]:
+    """Yield ``(key, node_dict)`` pairs regardless of the nodes container shape."""
+    nodes = state.get("nodes")
+    if isinstance(nodes, dict):
+        return [(k, v) for k, v in nodes.items() if isinstance(v, dict)]
+    if isinstance(nodes, list):
+        return [(i, v) for i, v in enumerate(nodes) if isinstance(v, dict)]
+    return []
+
+
+def node_sid(key: Any, node: Dict[str, Any]) -> str:
+    """Best-effort SID for a node — prefer the explicit field, fall back to key."""
+    return str(node.get("sid") or key or "")
+
+
+def find_node_by_sid(state: Dict[str, Any], sid: str) -> Optional[Dict[str, Any]]:
+    """Case-insensitive lookup of a node by SID; ``None`` if absent."""
+    want = (sid or "").strip().upper()
+    for key, node in iter_nodes(state):
+        if node_sid(key, node).upper() == want:
+            return node
+    return None
+
+
+def node_has_verified_cred(node: Dict[str, Any]) -> bool:
+    """True when the node carries at least one credential with ``verified: true``."""
+    for cred in node.get("credentials") or []:
+        if isinstance(cred, dict) and cred.get("verified") is True:
+            return True
+    return False
+
+
+def node_search_haystack(node: Dict[str, Any]) -> str:
+    """Concatenated, lower-cased text searched by ``search_node``."""
+    sapology = node.get("sapology_data") or node.get("sapology") or {}
+    if not isinstance(sapology, dict):
+        sapology = {}
+    parts = [
+        node.get("sid", ""),
+        node.get("description", ""),
+        sapology.get("description", ""),
+    ]
+    return " ".join(str(p) for p in parts).lower()
+
+
+# ---------------------------------------------------------------------------
+# Command framework
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Arg:
+    """Declarative description of a positional command argument."""
+    name: str
+    required: bool = False
+    help: str = ""
+
+
+@dataclass
+class CommandResult:
+    """Outcome of running a command.  ``ok`` drives the prompt's status marker."""
+    ok: bool = True
+    message: str = ""
+
+
+# A condition is a predicate over the context plus the message shown when it
+# fails.  Commands run only when every condition holds — this is how, e.g.,
+# ``rfc-connect`` can be restricted to "a node is selected, it is ABAP, and it
+# has credentials".  The reusable predicate factories below build these.
+Condition = Tuple[Callable[["CommandContext"], bool], str]
+
+
+@dataclass
+class Command:
+    """A plugin command: a name, aliases, args, gating conditions and a handler."""
+    name: str
+    handler: Callable[["CommandContext", List[str]], CommandResult]
+    aliases: List[str] = field(default_factory=list)
+    args: List[Arg] = field(default_factory=list)
+    conditions: List[Condition] = field(default_factory=list)
+    help: str = ""
+
+    def usage(self) -> str:
+        parts = [self.name]
+        for a in self.args:
+            parts.append(f"<{a.name}>" if a.required else f"[{a.name}]")
+        return " ".join(parts)
+
+
+class CommandContext:
+    """Mutable session state shared across command invocations.
+
+    Holds the loaded ``.sapmap`` dict, the backing file path, the selected node,
+    an output sink (so the REPL is testable) and the outcome of the last command
+    (used to vary the prompt).
+    """
+
+    def __init__(self, state: Dict[str, Any], path: Optional[str] = None,
+                 out: Callable[[str], None] = print,
+                 inp: Callable[[str], str] = input):
+        self.state: Dict[str, Any] = state
+        self.path: Optional[str] = path
+        self.out = out
+        self.inp = inp  # used by interactive commands (e.g. 'show' paging)
+        self.selected_sid: Optional[str] = None
+        self.dirty: bool = False
+        self.running: bool = True
+        self.last_ok: Optional[bool] = None  # None until the first command runs
+
+    # -- selection helpers ---------------------------------------------------
+    def selected_node(self) -> Optional[Dict[str, Any]]:
+        if not self.selected_sid:
+            return None
+        return find_node_by_sid(self.state, self.selected_sid)
+
+    def echo(self, msg: str = "") -> None:
+        self.out(msg)
+
+
+# ---------------------------------------------------------------------------
+# Reusable condition predicates (plugin building blocks)
+# ---------------------------------------------------------------------------
+#
+# These let new commands declare their prerequisites declaratively, e.g.::
+#
+#     Command("rfc-connect", handler=_rfc_connect,
+#             conditions=[require_selected_node(), require_abap(),
+#                         require_credentials()])
+
+def require_selected_node() -> Condition:
+    return (lambda ctx: ctx.selected_node() is not None,
+            "no node selected — use 'un <SID>' first")
+
+
+def require_abap() -> Condition:
+    def _pred(ctx: CommandContext) -> bool:
+        node = ctx.selected_node() or {}
+        return "ABAP" in str(node.get("system_type", "")).upper()
+    return (_pred, "selected node is not an ABAP system")
+
+
+def require_credentials() -> Condition:
+    def _pred(ctx: CommandContext) -> bool:
+        node = ctx.selected_node() or {}
+        creds = node.get("credentials") or []
+        return bool(creds)
+    return (_pred, "selected node has no credentials")
+
+
+# ---------------------------------------------------------------------------
+# Built-in landscape commands
+# ---------------------------------------------------------------------------
+
+def _terminal_rows() -> int:
+    return shutil.get_terminal_size(fallback=(80, 24)).lines
+
+
+def cmd_list_nodes(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Print node SIDs, limited to what fits on screen unless 'a' is given."""
+    pairs = iter_nodes(ctx.state)
+    if not pairs:
+        ctx.echo("(no nodes in state)")
+        return CommandResult(ok=False, message="no nodes")
+
+    # (sid, node) sorted by SID; a trailing '*' flags a verified credential.
+    entries = sorted(((node_sid(k, n), n) for k, n in pairs), key=lambda t: t[0])
+    lines = [f"{sid}{'*' if node_has_verified_cred(node) else ''}" for sid, node in entries]
+
+    # 'a' dumps every node at once (no pausing — handy for piping); plain 'ln'
+    # pages the full list 'more'-style so nothing scrolls off screen.
+    dump_all = bool(args) and args[0].lower() in ("a", "all", "-a", "--all")
+    if dump_all:
+        for line in lines:
+            ctx.echo(line)
+        return CommandResult(ok=True, message=f"{len(lines)} shown")
+
+    fully = _page_lines(ctx, lines)
+    return CommandResult(ok=fully, message=f"{len(lines)} node(s)")
+
+
+def cmd_use_node(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Select a node by SID; on success the prompt gains '>SID'."""
+    sid = args[0]
+    node = find_node_by_sid(ctx.state, sid)
+    if node is None:
+        ctx.echo(f"no such SID: {sid}")
+        return CommandResult(ok=False, message=f"no such SID: {sid}")
+    # Normalise to the node's canonical SID casing for the prompt.
+    ctx.selected_sid = str(node.get("sid") or sid)
+    ctx.echo(f"selected {ctx.selected_sid}")
+    return CommandResult(ok=True, message=f"selected {ctx.selected_sid}")
+
+
+def cmd_search_node(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Substring search over sid / description / sapology description."""
+    needle = args[0].lower()
+    hits: List[Tuple[str, Dict[str, Any]]] = []
+    for key, node in iter_nodes(ctx.state):
+        if needle in node_search_haystack(node):
+            hits.append((node_sid(key, node), node))
+
+    if not hits:
+        ctx.echo(f"no match for '{args[0]}'")
+        return CommandResult(ok=False, message="no match")
+
+    for sid, node in sorted(hits, key=lambda t: t[0]):
+        sapology = node.get("sapology_data") or node.get("sapology") or {}
+        desc = node.get("description") or (
+            sapology.get("description") if isinstance(sapology, dict) else "") or ""
+        stype = node.get("system_type", "")
+        line = f"{sid:<10} {stype:<12} {desc}".rstrip()
+        ctx.echo(line)
+    return CommandResult(ok=True, message=f"{len(hits)} match(es)")
+
+
+def _value_to_lines(value: Any) -> List[str]:
+    """Render a node property value into a flat list of display lines.
+
+    Lists become one line per element (dicts/lists compact-JSON'd with an index
+    prefix); dicts are pretty-printed; scalars become a single line.
+    """
+    if isinstance(value, list):
+        lines: List[str] = []
+        for i, item in enumerate(value):
+            if isinstance(item, (dict, list)):
+                lines.append(f"[{i}] {json.dumps(item, default=str, ensure_ascii=False)}")
+            else:
+                lines.append(f"[{i}] {item}")
+        return lines or ["(empty list)"]
+    if isinstance(value, dict):
+        return json.dumps(value, indent=2, default=str,
+                          ensure_ascii=False).splitlines() or ["(empty dict)"]
+    return [str(value)]
+
+
+def _page_lines(ctx: CommandContext, lines: List[str],
+                page_size: Optional[int] = None) -> bool:
+    """Print lines a screenful at a time, 'more'-style.
+
+    Pauses between pages with a ``--More--`` prompt; the operator presses Enter
+    for the next page or ``q`` to stop.  Returns True if fully shown, False if
+    the operator quit early.  Short output (fits one page) prints with no pause.
+    """
+    rows = page_size if page_size is not None else max(1, _terminal_rows() - 1)
+    total = len(lines)
+    i = 0
+    while i < total:
+        for line in lines[i:i + rows]:
+            ctx.echo(line)
+        i += rows
+        if i >= total:
+            break
+        try:
+            answer = ctx.inp(f"--More-- ({total - i} more, Enter = next, q = quit) ")
+        except (EOFError, KeyboardInterrupt):
+            ctx.echo("")
+            return False
+        if answer.strip().lower() == "q":
+            ctx.echo(f"... ({total - i} more line(s) not shown)")
+            return False
+    return True
+
+
+def cmd_show(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Show one property of the selected node, paging long values like 'more'."""
+    node = ctx.selected_node() or {}
+    prop = args[0]
+    if prop not in node:
+        ctx.echo(f"no such property: {prop}")
+        available = ", ".join(sorted(k for k in node if not str(k).startswith("_")))
+        if available:
+            ctx.echo(f"available: {available}")
+        return CommandResult(ok=False, message="no such property")
+
+    lines = _value_to_lines(node[prop])
+    fully = _page_lines(ctx, lines)
+    return CommandResult(ok=fully, message=f"{prop}: {len(lines)} line(s)")
+
+
+# ---------------------------------------------------------------------------
+# Built-in housekeeping commands
+# ---------------------------------------------------------------------------
+
+def cmd_help(ctx: CommandContext, args: List[str]) -> CommandResult:
+    reg: "CommandRegistry" = ctx.state.get("__registry__")  # set by processor
+    if reg is None:
+        ctx.echo("no registry")
+        return CommandResult(ok=False)
+    ctx.echo("commands:")
+    for cmd in reg.unique_commands():
+        aliases = f" ({', '.join(cmd.aliases)})" if cmd.aliases else ""
+        ctx.echo(f"  {cmd.usage():<28}{aliases:<14} {cmd.help}")
+    return CommandResult(ok=True)
+
+
+def cmd_save(ctx: CommandContext, args: List[str]) -> CommandResult:
+    path = args[0] if args else ctx.path
+    if not path:
+        ctx.echo("no path to save to (pass one: 'save <file>')")
+        return CommandResult(ok=False, message="no path to save to")
+    try:
+        save_state_dict(ctx.state, path)
+    except OSError as exc:
+        ctx.echo(f"save failed: {exc}")
+        return CommandResult(ok=False, message=f"save failed: {exc}")
+    ctx.path = path
+    ctx.dirty = False
+    ctx.echo(f"saved -> {path}")
+    return CommandResult(ok=True, message="saved")
+
+
+def cmd_back(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Unselect the current node; the prompt drops the '/SID' segment."""
+    if not ctx.selected_sid:
+        ctx.echo("no node selected")
+        return CommandResult(ok=False, message="nothing to unselect")
+    prev = ctx.selected_sid
+    ctx.selected_sid = None
+    ctx.echo(f"unselected {prev}")
+    return CommandResult(ok=True, message=f"unselected {prev}")
+
+
+def cmd_quit(ctx: CommandContext, args: List[str]) -> CommandResult:
+    ctx.running = False
+    if ctx.dirty:
+        ctx.echo("note: unsaved changes (use 'save' before 'quit' to persist)")
+    return CommandResult(ok=True, message="bye")
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+class CommandRegistry:
+    """Name/alias → :class:`Command` lookup table."""
+
+    def __init__(self) -> None:
+        self._by_name: Dict[str, Command] = {}
+
+    def register(self, cmd: Command) -> None:
+        for token in [cmd.name, *cmd.aliases]:
+            key = token.lower()
+            if key in self._by_name:
+                raise ValueError(f"duplicate command token: {token}")
+            self._by_name[key] = cmd
+
+    def resolve(self, token: str) -> Optional[Command]:
+        return self._by_name.get((token or "").lower())
+
+    def unique_commands(self) -> List[Command]:
+        seen: List[Command] = []
+        for cmd in self._by_name.values():
+            if cmd not in seen:
+                seen.append(cmd)
+        return seen
+
+
+def default_registry() -> CommandRegistry:
+    reg = CommandRegistry()
+    reg.register(Command(
+        name="list_nodes", aliases=["ln", "ls"], handler=cmd_list_nodes,
+        args=[Arg("a", required=False, help="'a' to dump all at once (no paging)")],
+        help="print node SIDs (paged; 'a' = dump all without paging)"))
+    reg.register(Command(
+        name="use_node_by_sid", aliases=["un", "use"], handler=cmd_use_node,
+        args=[Arg("sid", required=True, help="SID to select")],
+        help="select a node by SID (prompt gains '>SID')"))
+    reg.register(Command(
+        name="search_node", aliases=["sn"], handler=cmd_search_node,
+        args=[Arg("substring", required=True, help="text to search for")],
+        help="search sid/description/sapology for a substring"))
+    reg.register(Command(
+        name="show", aliases=["s", "cat"], handler=cmd_show,
+        args=[Arg("property", required=True, help="node property to display")],
+        conditions=[require_selected_node()],
+        help="show a property of the selected node (paged like 'more')"))
+    reg.register(Command(
+        name="help", aliases=["?", "h"], handler=cmd_help,
+        help="list available commands"))
+    reg.register(Command(
+        name="save", aliases=["w"], handler=cmd_save,
+        args=[Arg("path", required=False, help="optional target path")],
+        help="write the state back to the .sapmap file"))
+    reg.register(Command(
+        name="back", aliases=["b"], handler=cmd_back,
+        help="unselect the current node"))
+    reg.register(Command(
+        name="quit", aliases=["q", "exit"], handler=cmd_quit,
+        help="exit the processor"))
+    return reg
+
+
+# ---------------------------------------------------------------------------
+# Persistence (raw dict <-> .sapmap JSON)
+# ---------------------------------------------------------------------------
+
+def load_state_dict(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a JSON object at top level")
+    return data
+
+
+def save_state_dict(state: Dict[str, Any], path: str) -> None:
+    # Never persist the transient registry handle we stash on the dict.
+    payload = {k: v for k, v in state.items() if not str(k).startswith("__")}
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Processor / REPL
+# ---------------------------------------------------------------------------
+
+class CommandProcessor:
+    """Drives the recurring prompt loop over a loaded ``.sapmap`` dict."""
+
+    def __init__(self, state: Dict[str, Any], path: Optional[str] = None,
+                 registry: Optional[CommandRegistry] = None,
+                 out: Callable[[str], None] = print,
+                 inp: Callable[[str], str] = input):
+        self.ctx = CommandContext(state, path, out=out, inp=inp)
+        self.registry = registry or default_registry()
+        # Expose the registry to the ``help`` command without a global.
+        self.ctx.state["__registry__"] = self.registry
+        self.inp = inp
+
+    # -- prompt --------------------------------------------------------------
+    def _base_label(self) -> str:
+        """The leading prompt segment: the .sapmap file's name without its
+        directory or extension (``states/foo.sapmap`` -> ``foo``)."""
+        if self.ctx.path:
+            stem = os.path.splitext(os.path.basename(self.ctx.path))[0]
+            if stem:
+                return stem
+        return "sapmap"
+
+    def prompt(self) -> str:
+        """Build the varying prompt string.
+
+        Base = part of the file name; ``/SID`` appended when a node is selected;
+        a ``(!)`` marker after a failed command — so the prompt reflects both the
+        current selection and the last outcome.  E.g. with file ``landscape.sapmap``
+        and node ``CET`` selected: ``landscape/CET>$``.
+        """
+        text = self._base_label()
+        if self.ctx.selected_sid:
+            text += f"/{self.ctx.selected_sid}"
+        marker = " (!)" if self.ctx.last_ok is False else ""
+        return f"{text}{marker}>$ "
+
+    # -- dispatch ------------------------------------------------------------
+    def dispatch(self, line: str) -> Optional[CommandResult]:
+        """Parse and execute a single input line.  ``None`` = empty/comment."""
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+
+        tokens = line.split()
+        name, args = tokens[0], tokens[1:]
+        cmd = self.registry.resolve(name)
+        if cmd is None:
+            self.ctx.echo(f"unknown command: {name} (try 'help')")
+            return CommandResult(ok=False, message="unknown command")
+
+        # Arg-count validation against the declared required args.
+        required = sum(1 for a in cmd.args if a.required)
+        if len(args) < required:
+            self.ctx.echo(f"usage: {cmd.usage()}")
+            return CommandResult(ok=False, message="bad usage")
+
+        # Condition gating — every condition must hold or the command is refused.
+        for predicate, message in cmd.conditions:
+            if not predicate(self.ctx):
+                self.ctx.echo(f"cannot run '{cmd.name}': {message}")
+                return CommandResult(ok=False, message=message)
+
+        result = cmd.handler(self.ctx, args)
+        if result is None:
+            result = CommandResult(ok=True)
+        return result
+
+    # -- loop ----------------------------------------------------------------
+    def run(self) -> None:
+        """Recurring-prompt loop until quit or EOF."""
+        while self.ctx.running:
+            try:
+                line = self.inp(self.prompt())
+            except EOFError:
+                self.ctx.echo("")
+                break
+            except KeyboardInterrupt:
+                self.ctx.echo("^C (use 'quit' to exit)")
+                continue
+
+            result = self.dispatch(line)
+            if result is not None:
+                self.ctx.last_ok = result.ok
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip().splitlines()[0])
+        print("usage: sapmap_cmdproc.py <file.sapmap>")
+        return 0 if argv else 2
+
+    path = argv[0]
+    try:
+        state = load_state_dict(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    proc = CommandProcessor(state, path=path)
+    proc.ctx.echo(f"loaded {path} — {len(iter_nodes(state))} node(s). Type 'help'.")
+    proc.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
