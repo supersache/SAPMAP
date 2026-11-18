@@ -43,12 +43,14 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import modules
+
 
 # ---------------------------------------------------------------------------
 # State helpers — operate on the raw .sapmap dict
 # ---------------------------------------------------------------------------
 #
-# ``nodes`` in a .sapmap file is a dict keyed by SID (``{"GFE": {...}}``), but
+# ``nodes`` in a .sapmap file is a dict keyed by SID (``{"KAI": {...}}``), but
 # older/hand-edited files may carry a list.  ``iter_nodes`` normalises both into
 # a list of ``(key, node)`` pairs so the rest of the code never has to care.
 
@@ -331,6 +333,156 @@ def cmd_show(ctx: CommandContext, args: List[str]) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
+# RFC_READ_TABLE command
+# ---------------------------------------------------------------------------
+#
+# These helpers are deliberately plain module-level functions (no class): the
+# command processor already owns all the session state we need, so there is no
+# instance to carry.  They are adapted from a reference snippet that lived on a
+# connection-wrapper object (``self.conn``); here the open connection is passed
+# in explicitly instead.
+
+def rfc_safe_call(conn: Any, func_name: str, **kwargs) -> Tuple[Any, Optional[str]]:
+    """Call a function module and turn both error channels into one clear error.
+
+    Returns ``(result, error)``.  On success ``error`` is ``None``; on failure
+    ``error`` is a human-readable message (and ``result`` is ``None``).
+
+    Python-level exceptions (``RFCError`` and its subclasses) are caught and
+    rendered via :func:`format_rfc_exception`.  Note that ``RFC_READ_TABLE``
+    reports problems (unknown table, buffer overflow, missing authorization)
+    by *raising* an ABAP exception rather than returning a BAPIRET2 structure,
+    so there is no BAPIRET2 post-check to run here.
+    """
+    # Lazy imports: the RFC backend (and its exception classes) pull in the
+    # protocol layer, which we only want to touch when an RFC command actually
+    # runs — keeping the plain .sapmap editing commands dependency-free.
+    from sapmap_errors import format_rfc_exception
+    from sap_rfc_ctypes import (
+        ABAPApplicationError, ABAPRuntimeError,
+        CommunicationError, LogonError, RFCError,
+    )
+
+    try:
+        result = conn.call(func_name, **kwargs)
+    except LogonError as e:
+        return None, f"[{func_name}] logon failed: {format_rfc_exception(e)}"
+    except CommunicationError as e:
+        return None, f"[{func_name}] connection/gateway: {format_rfc_exception(e)}"
+    except ABAPApplicationError as e:
+        return None, f"[{func_name}] ABAP exception '{getattr(e, 'key', '')}': {format_rfc_exception(e)}"
+    except ABAPRuntimeError as e:
+        return None, f"[{func_name}] ABAP runtime error/dump: {format_rfc_exception(e)}"
+    except RFCError as e:
+        return None, f"[{func_name}] RFC error: {format_rfc_exception(e)}"
+
+    return result, None
+
+
+def rfc_read_table(conn: Any, tablename: str, attrs: str,
+                   where: Optional[str] = None,
+                   destination: Optional[str] = None,
+                   rowcount: int = 1000) -> Tuple[Any, Optional[str]]:
+    """Read ``attrs`` (comma-separated columns) from ``tablename`` via RFC_READ_TABLE.
+
+    ``where`` is an optional WHERE clause (open-SQL syntax, e.g.
+    ``MANDT = '000'``); ``destination`` an optional RFC destination to route the
+    read through.  Returns ``(result, error)`` from :func:`rfc_safe_call`.
+    """
+    # Build the FIELDS table — one {FIELDNAME: COL} row per requested column.
+    attrs_array = [x.strip() for x in attrs.split(",") if x.strip()]
+    fields = [{"FIELDNAME": x.upper()} for x in attrs_array]
+
+    params: Dict[str, Any] = {
+        "QUERY_TABLE": tablename.upper(),
+        "DELIMITER": "|",
+        "FIELDS": fields,
+        "ROWCOUNT": rowcount,
+    }
+
+    if where:
+        # RFC_READ_TABLE truncates each OPTIONS line at 72 characters, so split
+        # a long WHERE clause into 72-char chunks across multiple TEXT rows.
+        params["OPTIONS"] = [{"TEXT": where[i:i + 72]}
+                             for i in range(0, len(where), 72)]
+
+    if destination:
+        params["DESTINATION"] = destination
+
+    return rfc_safe_call(conn, "RFC_READ_TABLE", **params)
+
+
+def _render_read_table(result: Dict[str, Any]) -> List[str]:
+    """Turn an RFC_READ_TABLE result into aligned, printable text lines.
+
+    The FM returns FIELDS (column metadata) and DATA (``{"WA": "a|b|c"}`` rows,
+    delimited by the "|" we requested).  We split each row back on "|" and pad
+    every column to the width of the widest value so it reads like a table.
+    """
+    field_names = [f.get("FIELDNAME", "") for f in result.get("FIELDS", [])]
+    rows = [r.get("WA", "").split("|") for r in result.get("DATA", [])]
+
+    # Compute per-column width from the header and every cell.
+    widths = [len(name) for name in field_names]
+    for row in rows:
+        for i, cell in enumerate(row):
+            if i < len(widths):
+                widths[i] = max(widths[i], len(cell))
+
+    def fmt(cells: List[str]) -> str:
+        return " | ".join(
+            str(cells[i]).ljust(widths[i]) if i < len(cells) else "".ljust(widths[i])
+            for i in range(len(widths))
+        ).rstrip()
+
+    lines = [fmt(field_names), "-+-".join("-" * w for w in widths)]
+    lines.extend(fmt(row) for row in rows)
+    lines.append(f"({len(rows)} row(s))")
+    return lines
+
+
+def cmd_read_table(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """RFC_READ_TABLE against the selected node: 'rt <table> <col,col> [where]'."""
+    # Lazy imports so the RFC/model stack is only pulled in when used.
+    from sapmap_models import SAPNode
+    from sapmap_rfc import _get_connection, get_sdk_path
+
+    # RFC_READ_TABLE only runs over the NW RFC SDK backend — refuse early with a
+    # clear hint when the operator did not pass --sdk on the command line.
+    if not get_sdk_path():
+        ctx.echo("no NW RFC SDK path set — restart with '--sdk <PATH>'")
+        return CommandResult(ok=False, message="no sdk path")
+
+    tablename = args[0]
+    attrs = args[1]
+    # Everything after the first two tokens is the (space-containing) WHERE clause.
+    where = " ".join(args[2:]) if len(args) > 2 else None
+
+    # The processor edits the raw .sapmap dict; rebuild a SAPNode so we can reuse
+    # _get_connection (credential selection, host/instance resolution, SNC, …).
+    node_dict = ctx.selected_node() or {}
+    try:
+        node = SAPNode.from_dict(node_dict)
+    except Exception as exc:  # defensive: hand-edited/partial node dicts
+        ctx.echo(f"cannot build node from state: {exc}")
+        return CommandResult(ok=False, message="bad node")
+
+    try:
+        with _get_connection(node) as conn:
+            result, error = rfc_read_table(conn, tablename, attrs, where=where)
+    except Exception as exc:  # connection setup errors (no creds, SDK missing, …)
+        ctx.echo(f"connect failed: {exc}")
+        return CommandResult(ok=False, message=f"connect failed: {exc}")
+
+    if error:
+        ctx.echo(error)
+        return CommandResult(ok=False, message=error)
+
+    fully = _page_lines(ctx, _render_read_table(result))
+    return CommandResult(ok=fully, message=f"read {tablename}")
+
+
+# ---------------------------------------------------------------------------
 # Built-in housekeeping commands
 # ---------------------------------------------------------------------------
 
@@ -427,6 +579,13 @@ def default_registry() -> CommandRegistry:
         args=[Arg("property", required=True, help="node property to display")],
         conditions=[require_selected_node()],
         help="show a property of the selected node (paged like 'more')"))
+    reg.register(Command(
+        name="read_table", aliases=["rt"], handler=cmd_read_table,
+        args=[Arg("table", required=True, help="table name (e.g. USR02)"),
+              Arg("columns", required=True, help="comma-separated columns (e.g. BNAME,CLASS)"),
+              Arg("where", required=False, help="optional WHERE clause")],
+        conditions=[require_selected_node(), require_abap(), require_credentials()],
+        help="RFC_READ_TABLE on the selected node"))
     reg.register(Command(
         name="help", aliases=["?", "h"], handler=cmd_help,
         help="list available commands"))
@@ -559,18 +718,32 @@ class CommandProcessor:
 # ---------------------------------------------------------------------------
 
 def main(argv: Optional[List[str]] = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__.strip().splitlines()[0])
-        print("usage: sapmap_cmdproc.py <file.sapmap>")
-        return 0 if argv else 2
+    import argparse
 
-    path = argv[0]
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(
+        prog="sapmap_cmdproc.py",
+        description=__doc__.strip().splitlines()[0])
+    parser.add_argument("file", help="the .sapmap session file to open")
+    parser.add_argument("--sdk", metavar="PATH", default=None,
+                        help="NW RFC SDK library path (required for RFC "
+                             "commands such as 'read_table')")
+    args = parser.parse_args(argv)
+
+    path = args.file
     try:
         state = load_state_dict(path)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    # RFC commands require the NW RFC SDK — register the path up front so
+    # _get_connection() picks the SDK (ctypes) backend.  Without --sdk the
+    # RFC commands still refuse cleanly at run time (see cmd_read_table).
+    if args.sdk:
+        from sapmap_rfc import set_sdk_path
+        set_sdk_path(args.sdk)
+        print(f"[*] NW RFC SDK path: {args.sdk}")
 
     proc = CommandProcessor(state, path=path)
     proc.ctx.echo(f"loaded {path} — {len(iter_nodes(state))} node(s). Type 'help'.")
