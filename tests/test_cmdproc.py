@@ -460,17 +460,22 @@ def test_secstore_refuses_without_sdk():
     assert any("no NW RFC SDK path" in l for l in out)
 
 
-def test_secstore_prints_results(monkeypatch):
+def test_secstore_writes_loot_file(monkeypatch, tmp_path):
+    import json as _json
     import sapmap_rfc
     import sapmap_secstore
+    import sapmap_state
     sapmap_rfc.set_sdk_path("/opt/nwrfcsdk/lib")
+    results = [
+        {"ident": "RFC/D1", "password": "pw1", "sid": "PRD",
+         "instance_nr": "00", "error": None},
+        {"ident": "RFC/D2", "password": None, "error": "empty DATA field"},
+    ]
     monkeypatch.setattr(sapmap_secstore, "download_and_decrypt",
-                        lambda node, creds, key_hex: [
-                            {"ident": "RFC/D1", "password": "pw1", "sid": "PRD",
-                             "instance_nr": "00", "error": None},
-                            {"ident": "RFC/D2", "password": None,
-                             "error": "empty DATA field"},
-                        ])
+                        lambda node, creds, key_hex: results)
+    # Redirect the loot directory into tmp so the test leaves no artifacts.
+    monkeypatch.setattr(sapmap_state, "ensure_loot_dir",
+                        lambda subdir="": str(tmp_path))
     out = []
     proc = CommandProcessor(_abap_cred_state(), out=out.append)
     proc.dispatch("un PRD")
@@ -478,6 +483,9 @@ def test_secstore_prints_results(monkeypatch):
     r = proc.dispatch("secstore")
     sapmap_rfc.set_sdk_path(None)       # reset global for other tests
     assert r.ok
-    assert any("RFC/D1" in l and "pw1" in l for l in out)
-    assert any("RFC/D2" in l and "ERROR" in l for l in out)
-    assert any("1 decrypted" in l for l in out)
+    # A summary line names the loot file; no per-entry passwords on the console.
+    assert any("2 entries" in l and "1 decrypted" in l for l in out)
+    assert not any("pw1" in l for l in out)
+    loot = list(tmp_path.glob("secstore_PRD_*.json"))
+    assert len(loot) == 1
+    assert _json.loads(loot[0].read_text()) == results

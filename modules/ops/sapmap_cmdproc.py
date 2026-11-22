@@ -696,8 +696,8 @@ def cmd_exec_local(ctx: CommandContext, args: List[str]) -> CommandResult:
 def cmd_secstore(ctx: CommandContext, args: List[str]) -> CommandResult:
     """Decrypt the ABAP SecStore of the selected node: 'secstore [key_hex]'.
 
-    Wraps :func:`sapmap_secstore.download_and_decrypt` and prints the recovered
-    entries to the console (no loot file yet).
+    Wraps :func:`sapmap_secstore.download_and_decrypt` and writes the recovered
+    entries to a JSON loot file under loot/secstore (same shape as the GUI).
     """
     # Lazy imports so the RFC/model/crypto stack is only pulled in when used.
     from sapmap_models import SAPNode
@@ -737,23 +737,13 @@ def cmd_secstore(ctx: CommandContext, args: List[str]) -> CommandResult:
         ctx.echo("no SecStore entries found")
         return CommandResult(ok=False, message="no entries")
 
-    # Print one line per entry: ident, extracted SID/instance, and the
-    # recovered password or the error that prevented decryption.
-    ok = 0
-    for entry in results:
-        ident = entry.get("ident", "")
-        if entry.get("error"):
-            ctx.echo(f"{ident}\tERROR: {entry['error']}")
-            continue
-        pw = entry.get("password")
-        sid = entry.get("sid", "")
-        inst = entry.get("instance_nr", "")
-        meta = f" [sid={sid} inst={inst}]" if (sid or inst) else ""
-        ctx.echo(f"{ident}\t{pw}{meta}")
-        if pw:
-            ok += 1
-    ctx.echo(f"({len(results)} entr{'y' if len(results) == 1 else 'ies'}, "
-             f"{ok} decrypted)")
+    # Persist to loot/secstore exactly like the GUI's SecStore handler.
+    import sapmap_state as _ss
+    outfile = sapmap_secstore.save_loot(
+        node.sid, results, _ss.ensure_loot_dir("secstore"))
+    ok = sum(1 for e in results if not e.get("error") and e.get("password"))
+    ctx.echo(f"{len(results)} entr{'y' if len(results) == 1 else 'ies'}, "
+             f"{ok} decrypted -> {outfile}")
     return CommandResult(ok=True, message=f"{ok}/{len(results)} decrypted")
 
 
@@ -871,7 +861,7 @@ def default_registry() -> CommandRegistry:
         name="secstore", aliases=["ss"], handler=cmd_secstore,
         args=[Arg("key_hex", required=False, help="optional RSECTAB key override")],
         conditions=[require_selected_node(), require_abap(), require_credentials()],
-        help="decrypt the ABAP SecStore of the selected node (printed to console)"))
+        help="decrypt the ABAP SecStore of the selected node (saved to loot/secstore)"))
     reg.register(Command(
         name="history", aliases=["hi"], handler=cmd_history,
         args=[Arg("a", required=False, help="'a' to dump all at once (no paging)")],
