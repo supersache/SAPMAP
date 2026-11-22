@@ -152,11 +152,17 @@ class CommandContext:
 
     def __init__(self, state: Dict[str, Any], path: Optional[str] = None,
                  out: Callable[[str], None] = print,
-                 inp: Callable[[str], str] = input):
+                 inp: Callable[[str], str] = input,
+                 history_path: Optional[str] = ".cmdhistory"):
         self.state: Dict[str, Any] = state
         self.path: Optional[str] = path
         self.out = out
         self.inp = inp  # used by interactive commands (e.g. 'show' paging)
+        # Local file every typed command is appended to; None disables history.
+        self.history_path: Optional[str] = history_path
+        # Re-entrant dispatch hook, wired by CommandProcessor; lets commands
+        # such as 'redo' feed another line back through the parser/gating.
+        self.dispatch: Optional[Callable[[str], Optional["CommandResult"]]] = None
         self.selected_sid: Optional[str] = None
         self.dirty: bool = False
         self.running: bool = True
@@ -483,6 +489,115 @@ def cmd_read_table(ctx: CommandContext, args: List[str]) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
+# Command history (persisted to a local .cmdhistory file)
+# ---------------------------------------------------------------------------
+
+def append_history(path: Optional[str], line: str) -> None:
+    """Append a single typed command line to the history file.
+
+    Best-effort: history is a convenience, so any I/O error is swallowed rather
+    than interrupting the REPL.  A ``None`` path disables history entirely.
+    """
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line.rstrip("\n") + "\n")
+    except OSError:
+        pass
+
+
+def read_history(path: Optional[str]) -> List[str]:
+    """Return all recorded command lines; empty if the file is absent/unreadable."""
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return [ln.rstrip("\n") for ln in fh]
+    except OSError:
+        return []
+
+
+def cmd_history(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Print the command history, paged by default or all at once with 'a'."""
+    lines = read_history(ctx.history_path)
+    if not lines:
+        ctx.echo("(no history)")
+        return CommandResult(ok=False, message="no history")
+
+    # Number the entries so operators can reference them.
+    width = len(str(len(lines)))
+    numbered = [f"{i:>{width}}  {ln}" for i, ln in enumerate(lines, start=1)]
+
+    # 'a' dumps everything without paging (handy for piping); plain 'history'
+    # pages 'more'-style — mirrors list_nodes' behaviour.
+    dump_all = bool(args) and args[0].lower() in ("a", "all", "-a", "--all")
+    if dump_all:
+        for line in numbered:
+            ctx.echo(line)
+        return CommandResult(ok=True, message=f"{len(numbered)} shown")
+
+    fully = _page_lines(ctx, numbered)
+    return CommandResult(ok=fully, message=f"{len(numbered)} entries")
+
+
+def _normalize_bang(line: str) -> str:
+    """Expand the compact redo form '!2' into '! 2' (shell-style).
+
+    Only rewrites when a '!' is glued to its argument; a bare '!' or an already
+    spaced '! 2' is returned unchanged.
+    """
+    if len(line) > 1 and line[0] == "!" and not line[1].isspace():
+        return "! " + line[1:]
+    return line
+
+
+def cmd_redo(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Re-run a command by its history number: 'redo <n>' (aliases '!', 'r').
+
+    The number matches the index shown by 'history'.  Note the just-typed
+    'redo <n>' line is itself recorded first, so later entries shift by one.
+    """
+    lines = read_history(ctx.history_path)
+    if not lines:
+        ctx.echo("(no history)")
+        return CommandResult(ok=False, message="no history")
+
+    try:
+        n = int(args[0])
+    except ValueError:
+        ctx.echo(f"not a number: {args[0]}")
+        return CommandResult(ok=False, message="bad index")
+
+    if n < 1 or n > len(lines):
+        ctx.echo(f"out of range: {n} (history has {len(lines)} entr"
+                 f"{'y' if len(lines) == 1 else 'ies'})")
+        return CommandResult(ok=False, message="out of range")
+
+    target = lines[n - 1]
+
+    # Guard against redo-of-redo (and thus accidental infinite loops): refuse
+    # when the referenced entry is itself a 'redo' invocation.
+    reg: Optional["CommandRegistry"] = ctx.state.get("__registry__")
+    # Normalise so a compact '!1' entry is recognised as a redo, same as dispatch.
+    guard_tokens = _normalize_bang(target).split()
+    first_token = guard_tokens[0] if guard_tokens else ""
+    resolved = reg.resolve(first_token) if reg else None
+    if resolved is not None and resolved.name == "redo":
+        ctx.echo(f"refusing to redo a 'redo' entry: {target}")
+        return CommandResult(ok=False, message="redo loop")
+
+    ctx.echo(f"> {target}")
+    if ctx.dispatch is None:  # defensive: context built without a processor
+        ctx.echo("redo unavailable (no dispatcher)")
+        return CommandResult(ok=False, message="no dispatcher")
+
+    result = ctx.dispatch(target)
+    # An empty/comment target dispatches to None — treat that as a no-op success.
+    return result if result is not None else CommandResult(ok=True, message="noop")
+
+
+# ---------------------------------------------------------------------------
 # OS command execution (SXPG_STEP_XPG_START) command
 # ---------------------------------------------------------------------------
 
@@ -642,6 +757,14 @@ def default_registry() -> CommandRegistry:
         conditions=[require_selected_node(), require_abap(), require_credentials()],
         help="run an OS command on the selected node (SXPG_STEP_XPG_START)"))
     reg.register(Command(
+        name="history", aliases=["hist"], handler=cmd_history,
+        args=[Arg("a", required=False, help="'a' to dump all at once (no paging)")],
+        help="print command history (paged; 'a' = dump all without paging)"))
+    reg.register(Command(
+        name="redo", aliases=["!", "r"], handler=cmd_redo,
+        args=[Arg("n", required=True, help="history number to re-run")],
+        help="re-run a command by its 'history' number"))
+    reg.register(Command(
         name="help", aliases=["?", "h"], handler=cmd_help,
         help="list available commands"))
     reg.register(Command(
@@ -688,8 +811,12 @@ class CommandProcessor:
     def __init__(self, state: Dict[str, Any], path: Optional[str] = None,
                  registry: Optional[CommandRegistry] = None,
                  out: Callable[[str], None] = print,
-                 inp: Callable[[str], str] = input):
-        self.ctx = CommandContext(state, path, out=out, inp=inp)
+                 inp: Callable[[str], str] = input,
+                 history_path: Optional[str] = ".cmdhistory"):
+        self.ctx = CommandContext(state, path, out=out, inp=inp,
+                                  history_path=history_path)
+        # Let commands (e.g. 'redo') re-run a line through full parsing/gating.
+        self.ctx.dispatch = self.dispatch
         self.registry = registry or default_registry()
         # Expose the registry to the ``help`` command without a global.
         self.ctx.state["__registry__"] = self.registry
@@ -711,13 +838,13 @@ class CommandProcessor:
         Base = part of the file name; ``/SID`` appended when a node is selected;
         a ``(!)`` marker after a failed command — so the prompt reflects both the
         current selection and the last outcome.  E.g. with file ``landscape.sapmap``
-        and node ``CET`` selected: ``landscape/CET>$``.
+        and node ``CET`` selected: ``landscape/CET>``.
         """
         text = self._base_label()
         if self.ctx.selected_sid:
             text += f"/{self.ctx.selected_sid}"
         marker = " (!)" if self.ctx.last_ok is False else ""
-        return f"{text}{marker}>$ "
+        return f"{text}{marker}> "
 
     # -- dispatch ------------------------------------------------------------
     def dispatch(self, line: str) -> Optional[CommandResult]:
@@ -725,6 +852,8 @@ class CommandProcessor:
         line = line.strip()
         if not line or line.startswith("#"):
             return None
+
+        line = _normalize_bang(line)
 
         tokens = line.split()
         name, args = tokens[0], tokens[1:]
@@ -762,6 +891,12 @@ class CommandProcessor:
             except KeyboardInterrupt:
                 self.ctx.echo("^C (use 'quit' to exit)")
                 continue
+
+            # Persist every non-empty, non-comment line before dispatching so the
+            # history survives even a command that crashes the loop.
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                append_history(self.ctx.history_path, stripped)
 
             result = self.dispatch(line)
             if result is not None:

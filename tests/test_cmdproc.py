@@ -298,3 +298,108 @@ def test_value_to_lines_shapes():
     assert _value_to_lines([]) == ["(empty list)"]
     assert _value_to_lines([1, 2]) == ["[0] 1", "[1] 2"]
     assert _value_to_lines({"a": 1})[0].startswith("{")
+
+
+# -- command history --------------------------------------------------------
+
+def test_history_records_typed_commands(tmp_path):
+    # run() appends every non-empty, non-comment line to the history file.
+    hp = tmp_path / ".cmdhistory"
+    state = {"nodes": {"GFE": {"sid": "GFE", "system_type": "ABAP"}}}
+    feed = iter(["ln a", "# comment", "   ", "un GFE", "quit"])
+    out = []
+    proc = CommandProcessor(state, out=out.append,
+                            inp=lambda prompt: next(feed),
+                            history_path=str(hp))
+    proc.run()
+    assert hp.read_text(encoding="utf-8").splitlines() == ["ln a", "un GFE", "quit"]
+
+
+def test_history_command_lists_entries(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("ln a\nun GFE\n", encoding="utf-8")
+    out = []
+    proc = CommandProcessor({}, out=out.append, history_path=str(hp))
+    r = proc.dispatch("history a")       # dump-all, never pages
+    assert r.ok
+    assert out == ["1  ln a", "2  un GFE"]
+
+
+def test_history_command_empty(tmp_path):
+    hp = tmp_path / ".cmdhistory"      # never created
+    out = []
+    proc = CommandProcessor({}, out=out.append, history_path=str(hp))
+    r = proc.dispatch("history")
+    assert not r.ok
+    assert out == ["(no history)"]
+
+
+# -- redo -------------------------------------------------------------------
+
+def test_redo_reruns_history_entry(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("un GFE\n", encoding="utf-8")
+    state = {"nodes": {"GFE": {"sid": "GFE", "system_type": "ABAP"}}}
+    out = []
+    proc = CommandProcessor(state, out=out.append, history_path=str(hp))
+    r = proc.dispatch("redo 1")           # re-runs 'un GFE'
+    assert r.ok
+    assert proc.ctx.selected_sid == "GFE"
+    assert out[0] == "> un GFE"
+
+
+def test_redo_aliases_bang_and_r(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("ln a\n", encoding="utf-8")
+    state = {"nodes": {"GFE": {"sid": "GFE"}}}
+    for token in ("! 1", "r 1"):
+        out = []
+        proc = CommandProcessor(state, out=out.append, history_path=str(hp))
+        assert proc.dispatch(token).ok
+        assert out[0] == "> ln a"
+
+
+def test_redo_out_of_range_and_nan(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("ln a\n", encoding="utf-8")
+    proc = CommandProcessor({}, out=[].append, history_path=str(hp))
+    assert not proc.dispatch("redo 5").ok      # out of range
+    assert not proc.dispatch("redo foo").ok    # not a number
+
+
+def test_redo_refuses_redo_entry(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("ln a\n! 1\n", encoding="utf-8")   # entry 2 is a redo
+    out = []
+    proc = CommandProcessor({"nodes": {}}, out=out.append, history_path=str(hp))
+    r = proc.dispatch("redo 2")
+    assert not r.ok
+    assert any("refusing to redo" in l for l in out)
+
+
+def test_redo_empty_history(tmp_path):
+    hp = tmp_path / ".cmdhistory"      # never created
+    out = []
+    proc = CommandProcessor({}, out=out.append, history_path=str(hp))
+    r = proc.dispatch("redo 1")
+    assert not r.ok
+    assert out == ["(no history)"]
+
+
+def test_redo_compact_bang_form(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("ln a\n", encoding="utf-8")
+    state = {"nodes": {"GFE": {"sid": "GFE"}}}
+    out = []
+    proc = CommandProcessor(state, out=out.append, history_path=str(hp))
+    assert proc.dispatch("!1").ok          # '!1' == '! 1'
+    assert out[0] == "> ln a"
+
+
+def test_redo_compact_form_refuses_redo_entry(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("ln a\n!1\n", encoding="utf-8")   # entry 2 is a compact redo
+    out = []
+    proc = CommandProcessor({"nodes": {}}, out=out.append, history_path=str(hp))
+    assert not proc.dispatch("redo 2").ok
+    assert any("refusing to redo" in l for l in out)
