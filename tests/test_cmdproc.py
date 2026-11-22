@@ -428,3 +428,56 @@ def test_clear_history_then_history_is_empty(tmp_path):
     r = proc.dispatch("history")
     assert not r.ok
     assert out == ["(no history)"]
+
+
+# -- secstore ---------------------------------------------------------------
+
+def _abap_cred_state():
+    return {"nodes": {"PRD": {"sid": "PRD", "system_type": "ABAP",
+                              "credentials": [{"username": "x", "password": "y",
+                                               "client": "000", "verified": True}]}}}
+
+
+def test_secstore_requires_credentials():
+    state = {"nodes": {"DEV": {"sid": "DEV", "system_type": "ABAP",
+                               "credentials": []}}}
+    out = []
+    proc = CommandProcessor(state, out=out.append)
+    proc.dispatch("un DEV")
+    r = proc.dispatch("secstore")
+    assert not r.ok
+    assert any("no credentials" in l for l in out)
+
+
+def test_secstore_refuses_without_sdk():
+    import sapmap_rfc
+    sapmap_rfc.set_sdk_path(None)
+    out = []
+    proc = CommandProcessor(_abap_cred_state(), out=out.append)
+    proc.dispatch("un PRD")
+    r = proc.dispatch("ss")
+    assert not r.ok
+    assert any("no NW RFC SDK path" in l for l in out)
+
+
+def test_secstore_prints_results(monkeypatch):
+    import sapmap_rfc
+    import sapmap_secstore
+    sapmap_rfc.set_sdk_path("/opt/nwrfcsdk/lib")
+    monkeypatch.setattr(sapmap_secstore, "download_and_decrypt",
+                        lambda node, creds, key_hex: [
+                            {"ident": "RFC/D1", "password": "pw1", "sid": "PRD",
+                             "instance_nr": "00", "error": None},
+                            {"ident": "RFC/D2", "password": None,
+                             "error": "empty DATA field"},
+                        ])
+    out = []
+    proc = CommandProcessor(_abap_cred_state(), out=out.append)
+    proc.dispatch("un PRD")
+    out.clear()
+    r = proc.dispatch("secstore")
+    sapmap_rfc.set_sdk_path(None)       # reset global for other tests
+    assert r.ok
+    assert any("RFC/D1" in l and "pw1" in l for l in out)
+    assert any("RFC/D2" in l and "ERROR" in l for l in out)
+    assert any("1 decrypted" in l for l in out)

