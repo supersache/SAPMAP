@@ -483,6 +483,55 @@ def cmd_read_table(ctx: CommandContext, args: List[str]) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
+# OS command execution (SXPG_STEP_XPG_START) command
+# ---------------------------------------------------------------------------
+
+def cmd_exec_local(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Run an OS command on the selected node: 'xpg <cmd> [params]'.
+
+    Thin wrapper over :func:`sapmap_rfc.execute_local_command` — ``cmd`` is the
+    executable, everything after it is forwarded as the ``params`` string.
+    """
+    # Lazy imports so the RFC/model stack is only pulled in when used.
+    from sapmap_models import SAPNode
+    from sapmap_rfc import execute_local_command, get_sdk_path
+
+    # Like read_table, this goes through the NW RFC SDK backend — refuse early
+    # with a clear hint when the operator did not pass --sdk.
+    if not get_sdk_path():
+        ctx.echo("no NW RFC SDK path set — restart with '--sdk <PATH>'")
+        return CommandResult(ok=False, message="no sdk path")
+
+    command = args[0]
+    # Everything after the executable is the (space-containing) params string.
+    params = " ".join(args[1:]) if len(args) > 1 else ""
+
+    # The processor edits the raw .sapmap dict; rebuild a SAPNode so
+    # execute_local_command can resolve credentials, host/instance and SNC.
+    node_dict = ctx.selected_node() or {}
+    try:
+        node = SAPNode.from_dict(node_dict)
+    except Exception as exc:  # defensive: hand-edited/partial node dicts
+        ctx.echo(f"cannot build node from state: {exc}")
+        return CommandResult(ok=False, message="bad node")
+
+    try:
+        result = execute_local_command(node, command, params)
+    except Exception as exc:  # connection setup errors (SDK missing, etc.)
+        ctx.echo(f"exec failed: {exc}")
+        return CommandResult(ok=False, message=f"exec failed: {exc}")
+
+    # execute_local_command returns {success, output: [lines], error}.
+    for line in result.get("output") or []:
+        ctx.echo(str(line))
+    if not result.get("success"):
+        err = result.get("error") or "command failed"
+        ctx.echo(err)
+        return CommandResult(ok=False, message=err)
+    return CommandResult(ok=True, message="exec ok")
+
+
+# ---------------------------------------------------------------------------
 # Built-in housekeeping commands
 # ---------------------------------------------------------------------------
 
@@ -586,6 +635,12 @@ def default_registry() -> CommandRegistry:
               Arg("where", required=False, help="optional WHERE clause")],
         conditions=[require_selected_node(), require_abap(), require_credentials()],
         help="RFC_READ_TABLE on the selected node"))
+    reg.register(Command(
+        name="exec_local", aliases=["xpg", "elc"], handler=cmd_exec_local,
+        args=[Arg("cmd", required=True, help="executable (e.g. /bin/sh, cmd.exe)"),
+              Arg("params", required=False, help="command parameters")],
+        conditions=[require_selected_node(), require_abap(), require_credentials()],
+        help="run an OS command on the selected node (SXPG_STEP_XPG_START)"))
     reg.register(Command(
         name="help", aliases=["?", "h"], handler=cmd_help,
         help="list available commands"))
