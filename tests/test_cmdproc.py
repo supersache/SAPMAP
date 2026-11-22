@@ -81,15 +81,15 @@ def test_list_nodes_prints_sids():
 def test_use_node_selects_and_changes_prompt():
     proc, out = _proc(path="states/landscape.sapmap")
     # Base label is the file name without directory/extension.
-    assert proc.prompt() == "landscape>$ "
+    assert proc.prompt() == "landscape> "
     r = proc.dispatch("un GFE")
     assert r.ok and proc.ctx.selected_sid == "GFE"
-    assert proc.prompt() == "landscape/GFE>$ "
+    assert proc.prompt() == "landscape/GFE> "
 
 
 def test_prompt_falls_back_to_sapmap_without_path():
     proc, _ = _proc()
-    assert proc.prompt() == "sapmap>$ "
+    assert proc.prompt() == "sapmap> "
 
 
 def test_back_unselects_node():
@@ -99,7 +99,7 @@ def test_back_unselects_node():
     out.clear()
     r = proc.dispatch("back")
     assert r.ok and proc.ctx.selected_sid is None
-    assert proc.prompt() == "landscape>$ "
+    assert proc.prompt() == "landscape> "
     assert any("unselected GFE" in l for l in out)
 
 
@@ -403,3 +403,28 @@ def test_redo_compact_form_refuses_redo_entry(tmp_path):
     proc = CommandProcessor({"nodes": {}}, out=out.append, history_path=str(hp))
     assert not proc.dispatch("redo 2").ok
     assert any("refusing to redo" in l for l in out)
+
+
+# -- clear history ----------------------------------------------------------
+
+def test_clear_history_empties_file(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("ln a\nun GFE\n", encoding="utf-8")
+    out = []
+    proc = CommandProcessor({}, out=out.append, history_path=str(hp))
+    r = proc.dispatch("clear_history")
+    assert r.ok
+    assert hp.read_text(encoding="utf-8") == ""
+    assert out == ["history cleared"]
+
+
+def test_clear_history_then_history_is_empty(tmp_path):
+    hp = tmp_path / ".cmdhistory"
+    hp.write_text("ln a\n", encoding="utf-8")
+    out = []
+    proc = CommandProcessor({}, out=out.append, history_path=str(hp))
+    assert proc.dispatch("hc").ok          # alias
+    out.clear()
+    r = proc.dispatch("history")
+    assert not r.ok
+    assert out == ["(no history)"]

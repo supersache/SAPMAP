@@ -40,6 +40,7 @@ import json
 import os
 import shutil
 import sys
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -385,15 +386,39 @@ def rfc_safe_call(conn: Any, func_name: str, **kwargs) -> Tuple[Any, Optional[st
     return result, None
 
 
+def _rows_from_read_table(result: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Parse an RFC_READ_TABLE result into a list of ``{column: value}`` dicts.
+
+    The FM returns FIELDS (column metadata) and DATA (``{"WA": "a|b|c"}`` rows,
+    delimited by the "|" we requested).  We split each WA back on "|" and zip it
+    against the field names so the dumped JSON is self-describing.
+    """
+    field_names = [f.get("FIELDNAME", "").strip() for f in result.get("FIELDS", [])]
+    rows: List[Dict[str, str]] = []
+    for r in result.get("DATA", []):
+        values = r.get("WA", "").split("|")
+        rows.append({
+            (field_names[i] if i < len(field_names) else f"COL{i}"): values[i].strip()
+            for i in range(len(values))
+        })
+    return rows
+
+
 def rfc_read_table(conn: Any, tablename: str, attrs: str,
                    where: Optional[str] = None,
                    destination: Optional[str] = None,
-                   rowcount: int = 1000) -> Tuple[Any, Optional[str]]:
+                   rowcount: int = 1000,
+                   sid: str = "") -> Tuple[Optional[str], Optional[str]]:
     """Read ``attrs`` (comma-separated columns) from ``tablename`` via RFC_READ_TABLE.
 
     ``where`` is an optional WHERE clause (open-SQL syntax, e.g.
     ``MANDT = '000'``); ``destination`` an optional RFC destination to route the
-    read through.  Returns ``(result, error)`` from :func:`rfc_safe_call`.
+    read through; ``sid`` labels the output file.
+
+    The result is written to a timestamped JSON file under ``loot/tables``
+    (same shape as the GUI's "Read table" export), not printed.  Returns
+    ``(outfile, error)`` — ``outfile`` is ``None`` when the read returned no
+    rows, ``error`` is ``None`` on success.
     """
     # Build the FIELDS table — one {FIELDNAME: COL} row per requested column.
     attrs_array = [x.strip() for x in attrs.split(",") if x.strip()]
@@ -415,40 +440,32 @@ def rfc_read_table(conn: Any, tablename: str, attrs: str,
     if destination:
         params["DESTINATION"] = destination
 
-    return rfc_safe_call(conn, "RFC_READ_TABLE", **params)
+    result, error = rfc_safe_call(conn, "RFC_READ_TABLE", **params)
+    if error:
+        return None, error
 
+    rows = _rows_from_read_table(result)
 
-def _render_read_table(result: Dict[str, Any]) -> List[str]:
-    """Turn an RFC_READ_TABLE result into aligned, printable text lines.
-
-    The FM returns FIELDS (column metadata) and DATA (``{"WA": "a|b|c"}`` rows,
-    delimited by the "|" we requested).  We split each row back on "|" and pad
-    every column to the width of the widest value so it reads like a table.
-    """
-    field_names = [f.get("FIELDNAME", "") for f in result.get("FIELDS", [])]
-    rows = [r.get("WA", "").split("|") for r in result.get("DATA", [])]
-
-    # Compute per-column width from the header and every cell.
-    widths = [len(name) for name in field_names]
-    for row in rows:
-        for i, cell in enumerate(row):
-            if i < len(widths):
-                widths[i] = max(widths[i], len(cell))
-
-    def fmt(cells: List[str]) -> str:
-        return " | ".join(
-            str(cells[i]).ljust(widths[i]) if i < len(cells) else "".ljust(widths[i])
-            for i in range(len(widths))
-        ).rstrip()
-
-    lines = [fmt(field_names), "-+-".join("-" * w for w in widths)]
-    lines.extend(fmt(row) for row in rows)
-    lines.append(f"({len(rows)} row(s))")
-    return lines
+    # Persist to loot/tables exactly like the GUI's read_table handler.
+    outfile = None
+    if rows:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        import sapmap_state as _ss
+        outfile = os.path.join(
+            _ss.ensure_loot_dir("tables"),
+            f"table_{tablename}_{sid}_{ts}.json"
+        )
+        with open(outfile, "w") as f:
+            json.dump(rows, f, indent=2)
+        print(f"[+] {len(rows)} rows from {tablename} saved to {outfile}")
+    return outfile, None
 
 
 def cmd_read_table(ctx: CommandContext, args: List[str]) -> CommandResult:
-    """RFC_READ_TABLE against the selected node: 'rt <table> <col,col> [where]'."""
+    """RFC_READ_TABLE against the selected node: 'rt <table> <col,col> [where]'.
+
+    The rows are saved to a JSON file under loot/tables, not printed.
+    """
     # Lazy imports so the RFC/model stack is only pulled in when used.
     from sapmap_models import SAPNode
     from sapmap_rfc import _get_connection, get_sdk_path
@@ -475,7 +492,8 @@ def cmd_read_table(ctx: CommandContext, args: List[str]) -> CommandResult:
 
     try:
         with _get_connection(node) as conn:
-            result, error = rfc_read_table(conn, tablename, attrs, where=where)
+            outfile, error = rfc_read_table(conn, tablename, attrs,
+                                            where=where, sid=node.sid)
     except Exception as exc:  # connection setup errors (no creds, SDK missing, …)
         ctx.echo(f"connect failed: {exc}")
         return CommandResult(ok=False, message=f"connect failed: {exc}")
@@ -484,8 +502,12 @@ def cmd_read_table(ctx: CommandContext, args: List[str]) -> CommandResult:
         ctx.echo(error)
         return CommandResult(ok=False, message=error)
 
-    fully = _page_lines(ctx, _render_read_table(result))
-    return CommandResult(ok=fully, message=f"read {tablename}")
+    if not outfile:
+        ctx.echo(f"{tablename}: no rows")
+        return CommandResult(ok=False, message="no rows")
+
+    ctx.echo(f"saved -> {outfile}")
+    return CommandResult(ok=True, message=f"read {tablename}")
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +538,27 @@ def read_history(path: Optional[str]) -> List[str]:
             return [ln.rstrip("\n") for ln in fh]
     except OSError:
         return []
+
+
+def clear_history(path: Optional[str]) -> None:
+    """Wipe the history file's contents (truncate to empty).
+
+    Best-effort, mirroring append_history: a missing file or I/O error is not
+    an error — the goal state (empty history) is reached either way.
+    """
+    if not path:
+        return
+    try:
+        open(path, "w", encoding="utf-8").close()
+    except OSError:
+        pass
+
+
+def cmd_clear_history(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Delete the entire command history."""
+    clear_history(ctx.history_path)
+    ctx.echo("history cleared")
+    return CommandResult(ok=True, message="history cleared")
 
 
 def cmd_history(ctx: CommandContext, args: List[str]) -> CommandResult:
@@ -760,6 +803,9 @@ def default_registry() -> CommandRegistry:
         name="history", aliases=["hist"], handler=cmd_history,
         args=[Arg("a", required=False, help="'a' to dump all at once (no paging)")],
         help="print command history (paged; 'a' = dump all without paging)"))
+    reg.register(Command(
+        name="clear_history", aliases=["hc", "clearhist"], handler=cmd_clear_history,
+        help="delete the entire command history"))
     reg.register(Command(
         name="redo", aliases=["!", "r"], handler=cmd_redo,
         args=[Arg("n", required=True, help="history number to re-run")],

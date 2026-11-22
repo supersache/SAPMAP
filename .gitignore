@@ -123,4 +123,4 @@ docs/research/
 # SAP CommonCryptoLib / SNC material — the SAPCRYPTOLIB*.SAR package and
 # any PSE / cred_v2 keypairs unpacked from it.  Crypto blobs and key
 # material: local-only, never commit (same rationale as research/).
-CRYPTOLIB/
+CRYPTOLIB/.cmdhistory
