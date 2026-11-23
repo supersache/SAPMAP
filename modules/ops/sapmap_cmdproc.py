@@ -339,6 +339,27 @@ def cmd_show(ctx: CommandContext, args: List[str]) -> CommandResult:
     return CommandResult(ok=fully, message=f"{prop}: {len(lines)} line(s)")
 
 
+def cmd_cat(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Print the contents of a file, like the OS 'cat' command."""
+    path = args[0]
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            ctx.echo(fh.read().rstrip("\n"))
+    except FileNotFoundError:
+        ctx.echo(f"cat: {path}: No such file or directory")
+        return CommandResult(ok=False, message="no such file")
+    except IsADirectoryError:
+        ctx.echo(f"cat: {path}: Is a directory")
+        return CommandResult(ok=False, message="is a directory")
+    except PermissionError:
+        ctx.echo(f"cat: {path}: Permission denied")
+        return CommandResult(ok=False, message="permission denied")
+    except OSError as exc:
+        ctx.echo(f"cat: {path}: {exc.strerror or exc}")
+        return CommandResult(ok=False, message="read error")
+    return CommandResult(ok=True, message=f"cat {path}")
+
+
 # ---------------------------------------------------------------------------
 # RFC_READ_TABLE command
 # ---------------------------------------------------------------------------
@@ -840,7 +861,11 @@ def default_registry() -> CommandRegistry:
         args=[Arg("substring", required=True, help="text to search for")],
         help="search sid/description/sapology for a substring"))
     reg.register(Command(
-        name="show", aliases=["s", "cat"], handler=cmd_show,
+        name="cat", handler=cmd_cat,
+        args=[Arg("file", required=True, help="path of the file to print")],
+        help="print the contents of a file (like the OS 'cat')"))
+    reg.register(Command(
+        name="show", aliases=["s"], handler=cmd_show,
         args=[Arg("property", required=True, help="node property to display")],
         conditions=[require_selected_node()],
         help="show a property of the selected node (paged like 'more')"))

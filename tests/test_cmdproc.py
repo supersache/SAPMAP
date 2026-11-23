@@ -489,3 +489,39 @@ def test_secstore_writes_loot_file(monkeypatch, tmp_path):
     loot = list(tmp_path.glob("secstore_PRD_*.json"))
     assert len(loot) == 1
     assert _json.loads(loot[0].read_text()) == results
+
+
+# -- cat --------------------------------------------------------------------
+
+def test_cat_prints_file(tmp_path):
+    f = tmp_path / "hello.txt"
+    f.write_text("line1\nline2\n", encoding="utf-8")
+    out = []
+    proc = CommandProcessor({}, out=out.append)
+    r = proc.dispatch(f"cat {f}")
+    assert r.ok
+    assert out == ["line1\nline2"]
+
+
+def test_cat_missing_file():
+    out = []
+    proc = CommandProcessor({}, out=out.append)
+    r = proc.dispatch("cat /no/such/path")
+    assert not r.ok
+    assert any("No such file" in l for l in out)
+
+
+def test_cat_directory(tmp_path):
+    out = []
+    proc = CommandProcessor({}, out=out.append)
+    r = proc.dispatch(f"cat {tmp_path}")
+    assert not r.ok
+    assert any("Is a directory" in l for l in out)
+
+
+def test_cat_requires_file_arg():
+    out = []
+    proc = CommandProcessor({}, out=out.append)
+    r = proc.dispatch("cat")
+    assert not r.ok
+    assert any("usage: cat" in l for l in out)
