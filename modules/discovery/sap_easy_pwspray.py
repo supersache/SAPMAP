@@ -22,16 +22,16 @@ explicit written authorization — see DISCLAIMER.md.
 
 Usage:
     # one-time: seed the protocol file with the in-scope systems/clients
-    python3 sap_easy_pwspray.py --init-protocol
+    python3 sap_easy_pwspray.py --log run.log --init-protocol
 
     # dry-run collision check (short summary or long per-combo listing)
-    python3 sap_easy_pwspray.py -i scan.sapmap -c creds.txt --simulate
-    python3 sap_easy_pwspray.py -i scan.sapmap -c creds.txt --simulate long
+    python3 sap_easy_pwspray.py -i scan.sapmap -c data.creds --log run.log --simulate
+    python3 sap_easy_pwspray.py -i scan.sapmap -c data.creds --log run.log --simulate long
 
     # effective run (refuses if collisions exist)
-    python3 sap_easy_pwspray.py -i scan.sapmap -c creds.txt
-    python3 sap_easy_pwspray.py -i scan.sapmap -c creds.txt --include ACX,TPE:010
-    python3 sap_easy_pwspray.py -i scan.sapmap -c creds.txt --exclude BRP --confirm
+    python3 sap_easy_pwspray.py -i scan.sapmap -c data.creds --log run.log
+    python3 sap_easy_pwspray.py -i scan.sapmap -c data.creds --log run.log --include ACX,TPE:010
+    python3 sap_easy_pwspray.py -i scan.sapmap -c data.creds --log run.log --exclude BRP --confirm
 
 Author: Kai Ullrich & Claude
 """
@@ -61,14 +61,16 @@ RFC_CONNECT_FAILED = "CONNECT_FAILED"
 # ============================================================================
 
 def _sysnr_from_port(port):
-    """Derive the 2-digit SAP instance number from a dispatcher port.
+    """Derive the 2-digit SAP instance number from a dispatcher/gateway port.
 
-    Dispatcher ports are ``32<NN>`` (3200 + instance number), while the
-    RFC backend addresses the system by ``sysnr`` rather than a TCP port
-    (the SDK computes the gateway port 33<NN> itself).  3200 -> "00",
-    3201 -> "01", etc.
+    SAP instance ports encode the instance number in their last two
+    digits: dispatcher ports are ``32<NN>`` and gateway ports are
+    ``33<NN>`` (NN = instance number).  The RFC backend addresses the
+    system by ``sysnr`` rather than a TCP port (the SDK computes the
+    gateway port itself), so either port maps to the same sysnr:
+    3200/3300 -> "00", 3201/3301 -> "01", etc.
     """
-    return "%02d" % ((int(port) - 3200) % 100)
+    return "%02d" % (int(port) % 100)
 
 
 def attempt_login(method, host, port, client, user, password,
@@ -101,18 +103,30 @@ def attempt_login(method, host, port, client, user, password,
 # Scan-file parsing
 # ============================================================================
 
-def dispatcher_tuples(data):
-    """Yield (sid, "host:port", [clients]) for every ABAP node with a dispatcher.
+# Which instance service each login method connects to.  DIAG logs in at
+# the dispatcher (32NN); RFC logs on through the gateway (33NN).  These are
+# distinct ports, so a scan file that carries only one of them is valid for
+# the matching method — requiring a dispatcher for --method rfc (or vice
+# versa) would wrongly reject an in-scope system.
+_METHOD_SERVICE = {"diag": "dispatcher", "rfc": "gateway"}
+
+
+def instance_tuples(data, service):
+    """Yield (sid, "host:port", [clients], snc_partnername) per ABAP node.
+
+    ``service`` is the instance port role the login method needs:
+    ``"dispatcher"`` (the SAPGUI/DIAG port 32NN, used by --method diag) or
+    ``"gateway"`` (the RFC gateway port 33NN, used by --method rfc).
 
     For each node under ``data["nodes"]`` whose ``system_type == "ABAP"``,
-    pick the FIRST instance whose ``ports`` map contains a value of
-    ``"dispatcher"``.  The host is taken from the instance's
-    ``info.host`` (the resolvable FQDN the dispatcher reports) and falls
-    back to the instance ``ip``.  ``clients`` is the list of every ``nr``
-    under the node's ``clients`` array.
+    pick the FIRST instance whose ``ports`` map contains a value equal to
+    ``service``.  The host is taken from the instance's ``info.host`` (the
+    resolvable FQDN the instance reports) and falls back to the instance
+    ``ip``.  ``clients`` is the list of every ``nr`` under the node's
+    ``clients`` array.
 
-    Nodes without an ABAP type, without a dispatcher instance, or without
-    enumerated clients are skipped.
+    Nodes without an ABAP type, without an instance exposing ``service``,
+    or without enumerated clients are skipped.
     """
     for node in data.get("nodes", {}).values():
         if node.get("system_type") != "ABAP":
@@ -120,17 +134,17 @@ def dispatcher_tuples(data):
 
         inst = next(
             (i for i in node.get("instances", [])
-             if "dispatcher" in (i.get("ports") or {}).values()),
+             if service in (i.get("ports") or {}).values()),
             None,
         )
         if inst is None:
             continue
 
         port = next(p for p, svc in inst["ports"].items()
-                    if svc == "dispatcher")
+                    if svc == service)
         host = (inst.get("info") or {}).get("host") or inst.get("ip")
         clients = [c["nr"] for c in node.get("clients", []) if c.get("nr")]
-        snc_partnername = node.get ("snc_partnername")
+        snc_partnername = node.get("snc_partnername")
 
         if not host or not clients:
             continue
@@ -138,11 +152,17 @@ def dispatcher_tuples(data):
         yield (node.get("sid"), "%s:%s" % (host, port), clients, snc_partnername)
 
 
-def load_systems(path):
-    """Load a scan file and return the list of dispatcher tuples."""
+def load_systems(path, method="diag"):
+    """Load a scan file and return the instance tuples for ``method``.
+
+    The selected instance port depends on the login method: --method diag
+    needs a dispatcher (32NN), --method rfc needs a gateway (33NN).  See
+    :data:`_METHOD_SERVICE` and :func:`instance_tuples`.
+    """
+    service = _METHOD_SERVICE.get(method, "dispatcher")
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return list(dispatcher_tuples(data))
+    return list(instance_tuples(data, service))
 
 
 def load_snc_config(path):
@@ -614,9 +634,9 @@ WARNING: Failed login attempts can lock SAP accounts!
          Only use this tool with explicit authorization.
 
 Examples:
-  %(prog)s -i scan.sapmap -c creds.txt
-  %(prog)s -i scan.sapmap -c creds.txt --saprouter /H/10.0.0.1/S/3299
-  printf 'SAP*:06071992\\nDDIC:19920706\\n' | %(prog)s -i scan.sapmap -c - -y
+  %(prog)s -i scan.sapmap -c data.creds --log run.log
+  %(prog)s -i scan.sapmap -c data.creds --log run.log --saprouter /H/10.0.0.1/S/3299
+  printf 'SAP*:06071992\\nDDIC:19920706\\n' | %(prog)s -i scan.sapmap -c - --log run.log -y
         """)
     parser.add_argument("-i", "--input",
                         help="SAPMAP scan / .sapmap JSON file")
@@ -624,7 +644,7 @@ Examples:
                         help="Credentials as 'user:password' per line — a "
                              "'.creds' file path, inline text, or '-' for "
                              "stdin")
-    parser.add_argument("--protocol", required=True,
+    parser.add_argument("--log", dest="protocol", metavar="LOG", required=True,
                         help="Test-protocol JSON log (required)")
     parser.add_argument("--init-protocol", action="store_true",
                         help="Create a fresh protocol file seeded with the "
@@ -682,7 +702,7 @@ Examples:
     if not args.input or not args.creds:
         parser.error("-i/--input and -c/--creds are required")
 
-    systems = load_systems(args.input)
+    systems = load_systems(args.input, args.method)
     try:
         creds = parse_creds(read_creds_arg(args.creds))
     except ValueError as e:
@@ -710,7 +730,8 @@ Examples:
                   % ", ".join(missing))
 
     if not systems:
-        print("No ABAP dispatcher systems found in scan file.", file=sys.stderr)
+        print("No ABAP %s systems found in scan file." %
+              _METHOD_SERVICE.get(args.method, "dispatcher"), file=sys.stderr)
         return 1
     if not creds:
         print("No valid credentials parsed.", file=sys.stderr)
