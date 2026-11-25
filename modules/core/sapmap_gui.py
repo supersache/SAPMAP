@@ -2864,7 +2864,8 @@ class SAPMAPApi:
         t0 = time.monotonic()
         n_nodes_before = (len(self.state.nodes)
                           + len(getattr(self.state, "scc_nodes", {}))
-                          + len(getattr(self.state, "btp_subaccounts", {})))
+                          + len(getattr(self.state, "btp_subaccounts", {}))
+                          + len(getattr(self.state, "host_control_nodes", {})))
         f_before_cursor = sapmap_findings.get_since(0).get("cursor", 0)
         try:
             targets_str = config.get("targets", "")
@@ -2910,6 +2911,7 @@ class SAPMAPApi:
                 port_timeout=port_timeout,
                 node_callback=lambda node: self.state.add_node(node),
                 scc_callback=lambda scc: self.state.scc_nodes.update({scc.host: scc}),
+                hostcontrol_callback=lambda hc: self.state.upsert_host_control_node(hc),
                 scc_probe_default_creds=scc_probe_default_creds,
             )
 
@@ -2951,7 +2953,8 @@ class SAPMAPApi:
         # a non-zero delta.
         n_nodes_now = (len(self.state.nodes)
                        + len(getattr(self.state, "scc_nodes", {}))
-                       + len(getattr(self.state, "btp_subaccounts", {})))
+                       + len(getattr(self.state, "btp_subaccounts", {}))
+                       + len(getattr(self.state, "host_control_nodes", {})))
         added = max(0, n_nodes_now - n_nodes_before)
         # Count vulnerable SAP nodes (all-time, not just this scan —
         # findings buffer is per-session).  SCC/BTP nodes don't yet
@@ -7048,6 +7051,7 @@ def create_app(api: SAPMAPApi) -> Bottle:
                     node_callback=_cb,
                     scc_callback=lambda s: api.state.scc_nodes.update(
                         {s.host: s}),
+                    hostcontrol_callback=lambda hc: api.state.upsert_host_control_node(hc),
                 )
             except Exception as e:
                 print(f"[-] Standard scan failed on {host}: {e}")
@@ -8458,6 +8462,7 @@ def create_app(api: SAPMAPApi) -> Bottle:
                     mode=mode,
                     cancel_event=api.cancel_event,
                     node_callback=lambda n: api.state.add_node(n),
+                    hostcontrol_callback=lambda hc: api.state.upsert_host_control_node(hc),
                     verbose=True,
                 )
                 # Add any nodes not yet added via callback
