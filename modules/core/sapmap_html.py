@@ -693,6 +693,13 @@ body {
   margin-left: 8px; text-decoration: underline; text-underline-offset: 2px;
 }
 .detail-action-btn:hover { color: #79c0ff; }
+/* Destructive inline 'x' — remove instance (issue #92) */
+.detail-del-btn {
+  display: inline-block; margin-left: 8px; padding: 0 4px;
+  font-size: 11px; line-height: 1; color: #f85149; cursor: pointer;
+  opacity: 0.6; user-select: none;
+}
+.detail-del-btn:hover { opacity: 1; }
 /* Phase-progress indicator (top of details panel) */
 .phase-progress {
   display: flex; align-items: flex-start; justify-content: space-between;
@@ -1454,6 +1461,7 @@ body {
       <div class="ctx-item" data-action="betrusted">&#128272; Betrusted — Inject Trusted IP (10KBLAZE)</div>
       <div class="ctx-item" data-action="create_user_betrusted">&#128272; Create User (10KBLAZE Full Chain)</div>
       <div class="write-op ctx-item" data-action="set_attacker_ip" title="Override the attacker IP that 10KBLAZE / betrusted injects into the Gateway trust list.  Only needed when SAPMAP runs behind a SNAT'ing router (VPN / Docker-bridge / off-subnet host) — the auto-detect returns your LOCAL IP, but the GW sees the SNAT'd apparent source IP and the trust check fails even on a vulnerable kernel.  Set this to the IP the TARGET sees you as.">&#128269; Set 10KBLAZE Attacker IP (NAT override)&hellip;</div>
+      <div class="write-op ctx-item" data-action="set_gw_source_ip" title="Pin the source IP declared as the GW SAPXPG F_SAP_INIT ncpic_lu (what the gateway's reginfo matches registrations against).  DISTINCT from the 10KBLAZE attacker IP above — that one feeds the MS-betrusted trust list.  Needed when the GW SAPXPG exploit is tunnelled through a SAProuter/NAT: the gateway sees the router's IP as the peer, so the auto-detected LOCAL IP won't match a router-pinned reginfo — F_SAP_INIT silently fails and Step 3 hangs.  Set this to the gateway-visible IP (usually the SAProuter's own IP).  Blank = auto-detect (correct for a direct connection).">&#128272; Set GW Source IP (SAProuter/NAT)&hellip;</div>
       <div class="ctx-item" data-action="exploit_cve_58240_register">&#9889; Register Rogue ASCS Gateway (CVE-2026-58240)</div>
       <div class="ctx-item" data-action="exploit_cve_58240_unregister">&#128245; Unregister Rogue ASCS Gateway (cleanup)</div>
       <div class="ctx-item" data-action="create_user_java">&#128100; Create User (Java UME)</div>
@@ -3844,6 +3852,46 @@ body {
     <div class="form-actions" style="margin-top:12px">
       <button class="btn btn-primary" onclick="saveSetAttackerIp()">Save</button>
       <button class="btn" onclick="closeModal('set-attacker-ip-modal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================================
+     Set GW Source IP (SAProuter/NAT) — issue #79/#232.  Pins the per-node
+     gw_source_ip used as the GW SAPXPG F_SAP_INIT ncpic_lu.  SEPARATE from the
+     10KBLAZE attacker-IP modal above: this drives reginfo's LU-name match, not
+     the MS-betrusted TCP-source trust list.
+     ========================================================================= -->
+<div class="modal-overlay" id="set-gw-source-ip-modal">
+  <div class="modal" style="width:95vw;max-width:580px;max-height:90vh;overflow-y:auto">
+    <h3 style="color:#58a6ff">&#128272; Set GW Source IP (SAProuter/NAT)</h3>
+    <div id="set-gw-source-ip-info" style="font-size:12px;color:#8b949e;margin-bottom:10px"></div>
+    <p style="font-size:12px;color:#8b949e;line-height:1.5">
+      Only needed when the <strong>GW SAPXPG</strong> exploit is tunnelled
+      through a SAProuter (or any NAT).  F_SAP_INIT declares a CPIC LU name
+      (<code>ncpic_lu</code>) derived from the source IP; the gateway's
+      <code>reginfo</code> matches registrations against it.  Direct connect:
+      the auto-detected local socket IP is correct.  Through a router: the
+      gateway sees the <em>router's</em> IP as the peer — if reginfo is pinned
+      to that, the auto value won't match, P2 registration silently fails, and
+      Step&nbsp;3 hangs until timeout.
+    </p>
+    <p style="font-size:12px;color:#8b949e;line-height:1.5">
+      Enter the IP the <strong>gateway</strong> sees your connection coming
+      from (usually the SAProuter's own IP, or your NAT egress IP).  Leave
+      blank to clear and go back to auto-detect.  This is <strong>not</strong>
+      the 10KBLAZE attacker IP — that one feeds the MS-betrusted trust list.
+    </p>
+    <div class="form-row" style="margin-top:12px">
+      <label>GW source IP (what the gateway sees)</label>
+      <input type="text" id="set-gw-source-ip-value"
+             placeholder="e.g. the SAProuter IP  —  blank clears"
+             style="width:260px;font-family:monospace">
+    </div>
+    <div id="set-gw-source-ip-warning" style="margin-top:10px;color:#d29922;font-size:12px;display:none"></div>
+    <div class="form-actions" style="margin-top:12px">
+      <button class="btn btn-primary" onclick="saveSetGwSourceIp()">Save</button>
+      <button class="btn" onclick="closeModal('set-gw-source-ip-modal')">Cancel</button>
     </div>
   </div>
 </div>
@@ -6640,6 +6688,16 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// Issue #92 — instance numbers / pseudo-instances are alphanumeric
+// ('00','04','XX','WD').  Strip to [A-Za-z0-9] before embedding a value
+// into an inline onclick JS-string argument, so a crafted instance_nr
+// loaded from a .sapmap can never break out of the single-quoted string
+// literal (escHtml does not escape the single quote).  Lossless for all
+// legitimate values; defence-in-depth behind the route-side validation.
+function instKey(s) {
+  return String(s == null ? '' : s).replace(/[^A-Za-z0-9]/g, '');
+}
+
 // MITRE ATT&CK rendering helpers — pills next to findings, full section
 // in the node detail panel, and cell legends in the heatmap modal.
 // mapState.attack_catalog is populated by /api/attack/catalog (called
@@ -7636,6 +7694,12 @@ function showCtxMenu(e, sid) {
     // nodes before Check MS Betrusted had been run anywhere.
     // Re-appears automatically once ms_vulnerable flips True.
     'set_attacker_ip':       !hasMsVuln,
+    // "Set GW Source IP (SAProuter/NAT)" pins the F_SAP_INIT ncpic_lu for
+    // the GW SAPXPG exploit (issue #79/#232).  Follow create_user_gw's
+    // visibility — usable wherever that OS-layer primitive is (ABAP / Java
+    // / unknown stack), hidden only on nodes that can't host it (SAProuter,
+    // WebDispatcher).  Distinct from set_attacker_ip, which is betrusted-gated.
+    'set_gw_source_ip':      isSaprouter || isWebDispatcher,
     'download_secstore':     !isAbapStack,  // RSECTAB is an ABAP table
     'ransapware_encrypt':    !isAbapStack,
     'ransapware_decrypt':    !isAbapStack,
@@ -9377,6 +9441,12 @@ async function ctxAction(action) {
     case 'set_attacker_ip': {
       // Open the modal pre-filled with the current override (if any).
       showSetAttackerIpModal(sid);
+      break;
+    }
+    case 'set_gw_source_ip': {
+      // GW SAPXPG ncpic_lu source-IP override (issue #79/#232) — separate
+      // knob from the 10KBLAZE attacker IP above.
+      showSetGwSourceIpModal(sid);
       break;
     }
     case 'create_user_betrusted': {
@@ -12024,8 +12094,10 @@ function showDetails(sid, opts) {
       <h4>Instances</h4>
       ${(n.instances || []).map(i => {
         const ports = Object.keys(i.ports||{}).sort((a,b)=>a-b).join(', ');
-        return `<div class="detail-row"><span class="detail-key">Inst ${escHtml(i.instance_nr)}</span><span class="detail-val">${escHtml(i.ip)}${ports ? ' — Ports: '+ports : ''}</span></div>`;
+        return `<div class="detail-row"><span class="detail-key">Inst ${escHtml(i.instance_nr)}</span><span class="detail-val">${escHtml(i.ip)}${ports ? ' — Ports: '+ports : ''}<span class="detail-del-btn" title="Remove this instance from the map (durable — re-scans won't re-add it)" onclick="removeInstance('${escHtml(n.sid)}','${instKey(i.instance_nr)}')">&#10005;</span></span></div>`;
       }).join('')}
+      ${(n.instances || []).length === 0 ? '<div class="detail-row"><span class="detail-val" style="color:#d29922">&#9888; No instances — host-level actions unavailable until a re-scan.</span></div>' : ''}
+      ${(n.suppressed_instance_nrs && n.suppressed_instance_nrs.length) ? `<div class="detail-row"><span class="detail-key">Suppressed</span><span class="detail-val" style="color:#8b949e">${n.suppressed_instance_nrs.map(nr => `${escHtml(nr)} <span class="detail-action-btn" onclick="restoreInstance('${escHtml(n.sid)}','${instKey(nr)}')">restore</span>`).join(', ')}</span></div>` : ''}
     </div>
     <div class="detail-section">
       <h4>Open Ports</h4>
@@ -15764,6 +15836,46 @@ async function saveInstanceNr() {
   startPolling();
 }
 
+// Issue #92 — inline per-instance removal from the System Details panel.
+// Takes sid + instance_nr as explicit args (do NOT rely on the global
+// selectedNodeSid: the panel can be open via a live poll-refresh with no
+// fresh right-click).  Routine removals proceed silently; only the two
+// consequential cases prompt (native confirm, the house convention).
+async function removeInstance(sid, instNr) {
+  const n = (mapState.nodes || {})[sid];
+  const insts = (n && n.instances) ? n.instances : [];
+  const inst = insts.find(x => x.instance_nr === instNr);
+  const isLast = insts.length <= 1;
+  const hasGw = !!(inst && Object.entries(inst.ports || {}).some(
+    ([p, s]) => s === 'gateway' || (p >= 3300 && p <= 3399)));
+  if (isLast || hasGw) {
+    let msg = `Remove instance ${instNr} from ${sid}?\n\n` +
+      `This is a local map cleanup — the target system is untouched — and it ` +
+      `is durable: re-scans won't re-add it (use 'restore' to undo).`;
+    if (hasGw) msg += `\n\n⚠ This instance carries the gateway (33${instNr}) ` +
+      `port; GW-gated actions for ${sid} will be disabled until another gateway ` +
+      `instance is discovered.`;
+    if (isLast) msg += `\n\n⚠ This is the node's ONLY instance; removing it ` +
+      `disables all host-level actions until a re-scan.`;
+    if (!confirm(msg)) return;
+  }
+  const r = await api('POST', `node/${sid}/remove_instance`, { instance_nr: instNr });
+  if (r && r.error) { alert('Remove failed: ' + r.error); return; }
+  flashActivity(`${sid}: removed instance ${instNr}`, 3000);
+  startPolling();
+  await pollUpdates();
+}
+
+// Issue #92 — lift suppression (the 'restore' link); the backend re-adds
+// the removed instance row from its undo cache, so it reappears at once.
+async function restoreInstance(sid, instNr) {
+  const r = await api('POST', `node/${sid}/unsuppress_instance`, { instance_nr: instNr });
+  if (r && r.error) { alert('Restore failed: ' + r.error); return; }
+  flashActivity(`${sid}: restored instance ${instNr}`, 3000);
+  startPolling();
+  await pollUpdates();
+}
+
 function showSaprouterModal(sid) {
   const n = (mapState.nodes || {})[sid];
   document.getElementById('saprouter-system-info').textContent =
@@ -16874,6 +16986,55 @@ async function saveSetAttackerIp() {
     return;    // leave the modal open so operator can re-check
   }
   closeModal('set-attacker-ip-modal');
+}
+
+// ---------------------------------------------------------------------
+// GW SAPXPG source-IP override — Set GW Source IP modal (issue #79/#232).
+// Separate from the 10KBLAZE attacker-IP modal above: this pins the
+// F_SAP_INIT ncpic_lu (reginfo LU-name match) for routed GW SAPXPG runs.
+// ---------------------------------------------------------------------
+
+async function showSetGwSourceIpModal(sid) {
+  const modal = document.getElementById('set-gw-source-ip-modal');
+  modal.dataset.sid = sid;
+  const n = (mapState.nodes || {})[sid] || {};
+  const host = n.ip || n.hostname || '?';
+  const routed = n.saprouter ? '  (via SAProuter)' : '';
+  document.getElementById('set-gw-source-ip-info').textContent =
+    sid + '  →  target ' + host + routed;
+  // Reload current override from the backend (persistent on node).
+  let cur = {gw_source_ip: ''};
+  try {
+    cur = await api('GET', `node/${sid}/get_gw_source_ip`);
+    if (!cur) cur = {gw_source_ip: ''};
+  } catch (_) {}
+  document.getElementById('set-gw-source-ip-value').value =
+    cur.gw_source_ip || '';
+  document.getElementById('set-gw-source-ip-warning').style.display = 'none';
+  modal.classList.add('visible');
+  document.getElementById('set-gw-source-ip-value').focus();
+}
+
+async function saveSetGwSourceIp() {
+  const modal = document.getElementById('set-gw-source-ip-modal');
+  const sid = (modal && modal.dataset && modal.dataset.sid)
+              || selectedNodeSid;
+  if (!sid) { alert('No system selected.'); return; }
+  const ip = document.getElementById('set-gw-source-ip-value').value.trim();
+  const r = await api('POST', `node/${sid}/set_gw_source_ip`, {
+    gw_source_ip: ip,
+  });
+  if (r && r.error) {
+    alert('Save failed: ' + (r.message || r.error));
+    return;
+  }
+  if (r && r.routed_warning) {
+    const w = document.getElementById('set-gw-source-ip-warning');
+    w.textContent = '⚠️ ' + r.routed_warning;
+    w.style.display = '';
+    return;    // leave the modal open so operator can re-check
+  }
+  closeModal('set-gw-source-ip-modal');
 }
 
 function closeModal(id) { document.getElementById(id).classList.remove('visible'); }
